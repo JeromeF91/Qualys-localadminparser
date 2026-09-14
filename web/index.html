@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hotel administrator accounts</title>
+  <link rel="stylesheet" href="/styles.css?v=4" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <p class="eyebrow">Qualys · Administrator group members</p>
+      <h1>Hotel admin dashboard</h1>
+    </div>
+    <form id="search-form" class="search" autocomplete="off">
+      <label for="hotel-input">Hotel code</label>
+      <div class="search-box">
+        <input
+          id="hotel-input"
+          name="hotel"
+          maxlength="5"
+          placeholder="H1401 or V0011"
+          spellcheck="false"
+        />
+        <button type="submit">Filter</button>
+        <div id="suggest" class="suggest" hidden></div>
+      </div>
+      <p class="hint">H or V + 4 alphanumeric characters</p>
+    </form>
+  </header>
+
+  <main>
+    <section id="overview" class="panel"></section>
+    <section id="hotel-view" hidden></section>
+    <p id="status" class="status" hidden></p>
+  </main>
+
+  <script src="/app.js?v=5"></script>
+</body>
+</html>
