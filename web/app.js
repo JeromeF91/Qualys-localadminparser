@@ -149,14 +149,15 @@ function renderHotel(data) {
             <button type="button" id="lateral-zoom-out" title="Zoom out">−</button>
             <button type="button" id="lateral-zoom-reset" title="Reset view">Reset</button>
           </div>
-          <svg id="lateral-graph" viewBox="0 0 920 540" role="img" aria-label="Lateral movement graph"></svg>
+          <svg id="lateral-graph" viewBox="0 0 1000 680" role="img" aria-label="Lateral movement graph"></svg>
           <div id="lateral-tip" class="graph-tip" hidden></div>
           <div class="graph-legend">
             <span><i class="swatch compromised"></i> Compromised account</span>
             <span><i class="swatch workstation"></i> Workstation</span>
             <span><i class="swatch server"></i> Server</span>
-            <span><i class="swatch hop"></i> Extra host via dumped local</span>
-            <span class="muted">Hover a node for the computer name · click a yellow account to list its machines</span>
+            <span><i class="swatch hop"></i> Extra host via 2nd hop</span>
+            <span><i class="swatch hop3"></i> Extra host via 3rd hop</span>
+            <span class="muted">Hover a node for the computer name · click a yellow or purple account to list its machines</span>
           </div>
         </div>
         <div class="lateral-side">
@@ -166,6 +167,9 @@ function renderHotel(data) {
           <div class="mini-label">Second hop (local hash reuse)</div>
           <p class="muted hop-note" id="lateral-hop-note"></p>
           <div id="lateral-hops"></div>
+          <div class="mini-label">Third hop</div>
+          <p class="muted hop-note" id="lateral-third-note"></p>
+          <div id="lateral-hops3"></div>
         </div>
       </div>
     </div>
@@ -390,6 +394,15 @@ function outwardPolar(hx, hy, cx, cy, radius, index, total) {
   return [hx + radius * Math.cos(angle), hy + radius * Math.sin(angle)];
 }
 
+function outerLabel(x, y, ox, oy, nodeR) {
+  const dx = x - ox;
+  const dy = y - oy;
+  const len = Math.hypot(dx, dy);
+  if (len < 1) return { lx: x, ly: y + nodeR + 16 };
+  const dist = len + nodeR + 14;
+  return { lx: ox + (dx / len) * dist, ly: oy + (dy / len) * dist };
+}
+
 function shortLabel(text, max = 22) {
   const s = String(text || "");
   if (s.length <= max) return s;
@@ -421,16 +434,33 @@ function extraHostsFromHost(label, except) {
 
 function secondHops(compromised) {
   const direct = new Set(compromised.hosts || []);
+  return expandHops(direct, direct, compromised, 2);
+}
+
+function thirdHops(compromised, hop2) {
+  const hop2Hosts = new Set();
+  hop2.forEach((h) => h.extra.forEach((x) => hop2Hosts.add(x)));
+  const already = new Set(compromised.hosts || []);
+  hop2Hosts.forEach((h) => already.add(h));
+  return expandHops(hop2Hosts, already, compromised, 3);
+}
+
+function expandHops(fromHosts, alreadyReached, compromised, depth) {
   const hops = [];
   for (const other of dumpableLocals(compromised)) {
-    const overlap = (other.hosts || []).some((h) => direct.has(h));
-    if (!overlap) continue;
-    const extra = (other.hosts || []).filter((h) => !direct.has(h));
+    const origin = (other.hosts || []).filter((h) => fromHosts.has(h));
+    if (!origin.length) continue;
+    const extra = (other.hosts || []).filter((h) => !alreadyReached.has(h));
     if (!extra.length) continue;
-    hops.push({ admin: other, extra, origin: (other.hosts || []).filter((h) => direct.has(h)) });
+    hops.push({ admin: other, extra, origin, depth });
   }
   hops.sort((a, b) => b.extra.length - a.extra.length);
   return hops;
+}
+
+function findHop(account, hops, third) {
+  return (hops || []).find((h) => h.admin.account === account)
+    || (third || []).find((h) => h.admin.account === account);
 }
 
 function lateralViewState() {
@@ -554,14 +584,15 @@ function showLateralTip(svg, e) {
         ? `Also has local account ${escapeHtml(account)}`
         : `Has ${escapeHtml(adminDisplayName(window.__lateralAdmin))} as local admin`}</div>
     `;
-  } else if (kind === "hop-account" || kind === "hop-cluster") {
+  } else if (kind === "hop-account" || kind === "hop-cluster" || kind === "hop3-account") {
     const hopAdmin = (window.__hotel.unique_admins || []).find(
       (a) => a.kind === "local" && a.account === node.dataset.account
     );
     const hosts = (hopAdmin && hopAdmin.hosts) || [];
+    const depth = kind === "hop3-account" ? "3rd" : "2nd";
     html = `
       <div class="mono strong">${escapeHtml(node.dataset.account)}</div>
-      <div>Local account on ${fmt(hosts.length)} computer${hosts.length === 1 ? "" : "s"}</div>
+      <div>${depth} hop · local account on ${fmt(hosts.length)} computer${hosts.length === 1 ? "" : "s"}</div>
       <div class="muted">Click to list every machine this name appears on.</div>
     `;
   } else if (kind === "compromised") {
@@ -591,8 +622,12 @@ function onLateralNodeClick(dataset) {
     drawLateral(window.__lateralAdmin);
     return;
   }
-  if (kind === "hop-account" || kind === "hop-cluster") {
-    window.__lateralFocus = { type: "hop", account: dataset.account };
+  if (kind === "hop-account" || kind === "hop-cluster" || kind === "hop3-account") {
+    window.__lateralFocus = {
+      type: "hop",
+      account: dataset.account,
+      depth: kind === "hop3-account" ? 3 : 2,
+    };
     drawLateral(window.__lateralAdmin);
     return;
   }
@@ -607,7 +642,7 @@ function onLateralNodeClick(dataset) {
   }
 }
 
-function renderFocusPanel(admin, hops, hiddenWks) {
+function renderFocusPanel(admin, hops, third, hiddenWks) {
   const focus = window.__lateralFocus;
   const box = $("lateral-focus");
   if (!focus) {
@@ -619,16 +654,22 @@ function renderFocusPanel(admin, hops, hiddenWks) {
     return;
   }
   if (focus.type === "hop") {
-    const hop = hops.find((h) => h.admin.account === focus.account);
+    const hop = findHop(focus.account, hops, third);
     if (!hop) {
       box.innerHTML = "";
       return;
     }
+    const depth = hop.depth === 3 ? "Third hop" : "Second hop";
+    const fromLabel = hop.depth === 3
+      ? "Dumped from (reached at hop 2)"
+      : "Dumped from (already reached)";
     box.innerHTML = `
-      <div class="mini-label">This account is on</div>
+      <div class="mini-label">${depth} · this account is on</div>
       <div class="focus-head mono">${escapeHtml(hop.admin.account)}</div>
-      <p class="muted hop-note">Same local name on the machines below. Dump it from a reached host, then reuse it where it already exists.</p>
-      <div class="mini-label">Dumped from (already reached)</div>
+      <p class="muted hop-note">${hop.depth === 3
+        ? "Dump this local on a computer reached at hop 2, then reuse the same name where it already exists."
+        : "Same local name on the machines below. Dump it from a reached host, then reuse it where it already exists."}</p>
+      <div class="mini-label">${fromLabel}</div>
       ${hostPresenceTable(hop.origin)}
       <div class="mini-label">Also local admin on</div>
       ${hostPresenceTable(hop.extra)}
@@ -696,56 +737,73 @@ function hostPresenceTable(items) {
   </table>`;
 }
 
+function hopTableHtml(hops, focus, depth) {
+  if (!hops.length) return "";
+  return `<table>
+      <thead><tr><th>Local account</th><th>Extra hosts</th></tr></thead>
+      <tbody>
+        ${hops.slice(0, 12).map((h) => `
+          <tr class="hop-row${focus && focus.type === "hop" && focus.account === h.admin.account ? " selected" : ""}" data-account="${escapeHtml(h.admin.account)}" data-depth="${depth}">
+            <td class="mono">${escapeHtml(h.admin.account)}</td>
+            <td>${fmt(h.extra.length)}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+    ${hops.length > 12 ? `<div class="muted">Showing 12 of ${fmt(hops.length)} dump-and-reuse paths.</div>` : ""}`;
+}
+
 function drawLateral(admin) {
   if (!admin) return;
   window.__lateralAdmin = admin;
   const data = window.__hotel;
   const hops = secondHops(admin);
+  const third = thirdHops(admin, hops);
   const directHosts = (admin.hosts || []).map(hostMeta);
   const servers = directHosts.filter((h) => h.role === "server");
   const workstations = directHosts.filter((h) => h.role !== "server");
   const extraHostSet = new Set();
   hops.forEach((h) => h.extra.forEach((x) => extraHostSet.add(x)));
+  const hop3HostSet = new Set();
+  third.forEach((h) => h.extra.forEach((x) => hop3HostSet.add(x)));
   const extraCount = extraHostSet.size;
-  const pct = data.host_count ? Math.round((directHosts.length / data.host_count) * 100) : 0;
+  const hop3Count = hop3HostSet.size;
+  const totalReached = extraCount + hop3Count + directHosts.length;
+  const pct = data.host_count ? Math.round((totalReached / data.host_count) * 100) : 0;
   const focus = window.__lateralFocus;
 
-  $("lateral-summary").textContent = `${fmt(directHosts.length)} hosts reached (${pct}% of site)`;
+  $("lateral-summary").textContent = `${fmt(directHosts.length)} direct · +${fmt(extraCount)} hop 2 · +${fmt(hop3Count)} hop 3 (${pct}% of site)`;
   $("lateral-hop-note").textContent = excludeRotatingLocals()
-    ? "If the attacker dumps SAM/LSA on a reached host, other local accounts that also appear elsewhere can extend the path. Administrator, AdminDevice, and AdminIT are excluded — they use unique rotating passwords."
-    : "If the attacker dumps SAM/LSA on a reached host, other local accounts that also appear elsewhere can extend the path. Assumes the same local name reuses a password or hash.";
+    ? "Dump SAM/LSA on a reached host, then reuse other local names that appear elsewhere. Administrator, AdminDevice, and AdminIT are excluded — they use unique rotating passwords."
+    : "Dump SAM/LSA on a reached host, then reuse other local names that appear elsewhere. Assumes the same local name reuses a password or hash.";
+  $("lateral-third-note").textContent = third.length
+    ? "From computers reached at hop 2, dump other local accounts and reuse them on machines not yet reached."
+    : "No further hosts. Locals on hop-2 machines are not reused outside the computers already reached.";
   $("lateral-blast").innerHTML = `
     <div class="blast-line"><strong>${fmt(directHosts.length)}</strong> hosts with this account as local admin</div>
     <div class="blast-line">${fmt(workstations.length)} workstations · ${fmt(servers.length)} servers</div>
-    <div class="blast-line">${fmt(extraCount)} additional host${extraCount === 1 ? "" : "s"} reachable if a local hash is dumped and reused</div>
+    <div class="blast-line">${fmt(extraCount)} additional host${extraCount === 1 ? "" : "s"} at hop 2 (dump and reuse)</div>
+    <div class="blast-line">${fmt(hop3Count)} additional host${hop3Count === 1 ? "" : "s"} at hop 3</div>
   `;
   $("lateral-hops").innerHTML = hops.length
-    ? `<table>
-        <thead><tr><th>Local account</th><th>Extra hosts</th></tr></thead>
-        <tbody>
-          ${hops.slice(0, 12).map((h) => `
-            <tr class="hop-row${focus && focus.type === "hop" && focus.account === h.admin.account ? " selected" : ""}" data-account="${escapeHtml(h.admin.account)}">
-              <td class="mono">${escapeHtml(h.admin.account)}</td>
-              <td>${fmt(h.extra.length)}</td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-      ${hops.length > 12 ? `<div class="muted">Showing 12 of ${fmt(hops.length)} dump-and-reuse paths.</div>` : ""}`
-    : `<div class="muted">No extra hosts. Other local accounts on these machines are not reused outside this blast radius.</div>`;
+    ? hopTableHtml(hops, focus, 2)
+    : `<div class="muted">No extra hosts at hop 2.</div>`;
+  $("lateral-hops3").innerHTML = hopTableHtml(third, focus, 3);
 
   const svg = $("lateral-graph");
-  const cx = 390;
-  const cy = 270;
-  const maxWks = 40;
+  const cx = 500;
+  const cy = 340;
+  const maxWks = 22;
   const shownWks = workstations.slice(0, maxWks);
   const hiddenWks = workstations.slice(maxWks);
   const extraShown = hops.slice(0, 6);
+  const thirdShown = third.slice(0, 5);
+  const maxFocusExtra = 8;
 
   const lit = new Set();
   let hostExtras = [];
   if (focus && focus.type === "hop") {
-    const hop = hops.find((h) => h.admin.account === focus.account);
+    const hop = findHop(focus.account, hops, third);
     if (hop) {
       lit.add(`account:${hop.admin.account}`);
       hop.extra.forEach((h) => lit.add(`host:${h}`));
@@ -771,88 +829,133 @@ function drawLateral(admin) {
   const nodes = [];
 
   extraShown.forEach((hop, i) => {
-    const [x, y] = polar(cx, cy, 290, i, extraShown.length);
+    const [x, y] = polar(cx, cy, 370, i, extraShown.length);
     const hopLit = !dimmed || lit.has(`account:${hop.admin.account}`);
     lines.push(`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge hop${hopLit ? "" : " dim"}" />`);
     nodes.push({
-      x, y, r: 12, cls: "hop-account",
+      x, y, r: 14, cls: "hop-account",
       kind: "hop-account",
       key: `account:${hop.admin.account}`,
       account: hop.admin.account,
-      label: hop.admin.account,
+      label: shortLabel(hop.admin.account, 18),
       sub: `+${hop.extra.length} extra`,
-      title: `${hop.admin.account} is a local admin on ${hop.origin.length} reached computer(s) and ${hop.extra.length} more`,
+      title: `${hop.admin.account} · 2nd hop · ${hop.extra.length} extra computer(s)`,
+      ...outerLabel(x, y, cx, cy, 14),
+    });
+  });
+
+  thirdShown.forEach((hop, i) => {
+    const [x, y] = polar(cx, cy, 470, i, thirdShown.length);
+    const hopLit = !dimmed || lit.has(`account:${hop.admin.account}`);
+    lines.push(`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge hop3${hopLit ? "" : " dim"}" />`);
+    nodes.push({
+      x, y, r: 14, cls: "hop3-account",
+      kind: "hop3-account",
+      key: `account:${hop.admin.account}`,
+      account: hop.admin.account,
+      label: shortLabel(hop.admin.account, 18),
+      sub: `+${hop.extra.length} extra`,
+      title: `${hop.admin.account} · 3rd hop · ${hop.extra.length} extra computer(s)`,
+      ...outerLabel(x, y, cx, cy, 14),
     });
   });
 
   if (focus && focus.type === "hop") {
-    const hop = extraShown.find((h) => h.admin.account === focus.account)
-      || hops.find((h) => h.admin.account === focus.account);
-    const hopNode = nodes.find((n) => n.kind === "hop-account" && n.account === focus.account);
+    const hop = findHop(focus.account, hops, third);
+    const hopNode = nodes.find((n) => n.account === focus.account && (n.kind === "hop-account" || n.kind === "hop3-account"));
     if (hop && hopNode) {
-      hop.extra.forEach((label, j) => {
+      const shownExtra = hop.extra.slice(0, maxFocusExtra);
+      const hiddenExtra = hop.extra.length - shownExtra.length;
+      shownExtra.forEach((label, j) => {
+        if (nodes.some((n) => n.host === label)) return;
         const meta = hostMeta(label);
-        const [ex, ey] = outwardPolar(hopNode.x, hopNode.y, cx, cy, 72, j, hop.extra.length);
-        lines.push(`<line x1="${hopNode.x}" y1="${hopNode.y}" x2="${ex}" y2="${ey}" class="edge hop" />`);
+        const [ex, ey] = outwardPolar(hopNode.x, hopNode.y, cx, cy, 92, j, shownExtra.length + (hiddenExtra ? 1 : 0));
+        const edgeCls = hop.depth === 3 ? "hop3" : "hop";
+        lines.push(`<line x1="${hopNode.x}" y1="${hopNode.y}" x2="${ex}" y2="${ey}" class="edge ${edgeCls} active" />`);
         nodes.push({
-          x: ex, y: ey, r: 9,
-          cls: meta.role === "server" ? "hop-host server" : "hop-host",
+          x: ex, y: ey, r: 11,
+          cls: hop.depth === 3
+            ? (meta.role === "server" ? "hop3-host server" : "hop3-host")
+            : (meta.role === "server" ? "hop-host server" : "hop-host"),
           kind: "hop-host",
           key: `host:${label}`,
           host: label,
           account: hop.admin.account,
           label: meta.short,
-          title: `${meta.name}\n${label}\n${meta.ip}\n${meta.role}`,
+          title: `${meta.name}\n${label}\n${meta.ip}\n${meta.role}\nreached at hop ${hop.depth}`,
+          ...outerLabel(ex, ey, hopNode.x, hopNode.y, 11),
         });
       });
+      if (hiddenExtra) {
+        const [ex, ey] = outwardPolar(hopNode.x, hopNode.y, cx, cy, 92, shownExtra.length, shownExtra.length + 1);
+        nodes.push({
+          x: ex, y: ey, r: 16,
+          cls: hop.depth === 3 ? "hop3-host" : "hop-host",
+          kind: "hop-cluster",
+          key: `account:${hop.admin.account}`,
+          account: hop.admin.account,
+          label: `+${hiddenExtra} more`,
+          title: hop.extra.slice(maxFocusExtra).map((h) => hostMeta(h).name).join("\n"),
+          ...outerLabel(ex, ey, hopNode.x, hopNode.y, 16),
+        });
+      }
     }
   }
 
   servers.forEach((h, i) => {
-    const [x, y] = polar(cx, cy, 118, i, Math.max(servers.length, 1));
+    const [x, y] = polar(cx, cy, 140, i, Math.max(servers.length, 1));
     lines.push(`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge${!dimmed || lit.has(`host:${h.label}`) ? "" : " dim"}" />`);
     nodes.push({
-      x, y, r: 12, cls: "server",
+      x, y, r: 14, cls: "server",
       kind: "host",
       key: `host:${h.label}`,
       host: h.label,
       label: h.short,
       title: `${h.name}\n${h.dns || h.label}\n${h.ip}\nserver`,
+      ...outerLabel(x, y, cx, cy, 14),
     });
   });
 
   shownWks.forEach((h, i) => {
-    const [x, y] = polar(cx, cy, 208, i, shownWks.length + (hiddenWks.length ? 1 : 0));
+    const [x, y] = polar(cx, cy, 255, i, shownWks.length + (hiddenWks.length ? 1 : 0));
     lines.push(`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge${!dimmed || lit.has(`host:${h.label}`) ? "" : " dim"}" />`);
     nodes.push({
-      x, y, r: 8, cls: "workstation",
+      x, y, r: 11, cls: "workstation",
       kind: "host",
       key: `host:${h.label}`,
       host: h.label,
       label: h.short,
       title: `${h.name}\n${h.dns || h.label}\n${h.ip}\nworkstation`,
+      ...outerLabel(x, y, cx, cy, 11),
     });
   });
   if (hiddenWks.length) {
-    const [x, y] = polar(cx, cy, 208, shownWks.length, shownWks.length + 1);
+    const [x, y] = polar(cx, cy, 255, shownWks.length, shownWks.length + 1);
     lines.push(`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge${!dimmed || lit.has("wks-cluster") ? "" : " dim"}" />`);
     nodes.push({
-      x, y, r: 16, cls: "workstation cluster",
+      x, y, r: 18, cls: "workstation cluster",
       kind: "wks-cluster",
       key: "wks-cluster",
       label: `+${hiddenWks.length} WKS`,
       title: `${hiddenWks.length} more workstations`,
+      ...outerLabel(x, y, cx, cy, 18),
     });
   }
 
   if (focus && focus.type === "hop") {
-    const hopNode = nodes.find((n) => n.kind === "hop-account" && n.account === focus.account);
-    const hop = hops.find((h) => h.admin.account === focus.account);
+    const hopNode = nodes.find((n) => n.account === focus.account && (n.kind === "hop-account" || n.kind === "hop3-account"));
+    const hop = findHop(focus.account, hops, third);
     if (hopNode && hop) {
+      const edgeCls = hop.depth === 3 ? "hop3" : "hop";
       hop.origin.forEach((label) => {
-        const origin = nodes.find((n) => n.host === label && n.kind === "host");
+        const origin = nodes.find((n) => n.host === label);
         if (!origin) return;
-        lines.push(`<line x1="${origin.x}" y1="${origin.y}" x2="${hopNode.x}" y2="${hopNode.y}" class="edge hop" />`);
+        lines.push(`<line x1="${origin.x}" y1="${origin.y}" x2="${hopNode.x}" y2="${hopNode.y}" class="edge ${edgeCls} active" />`);
+      });
+      hop.extra.forEach((label) => {
+        const extra = nodes.find((n) => n.host === label);
+        if (!extra) return;
+        lines.push(`<line x1="${hopNode.x}" y1="${hopNode.y}" x2="${extra.x}" y2="${extra.y}" class="edge ${edgeCls} active" />`);
       });
     }
   }
@@ -863,37 +966,53 @@ function drawLateral(admin) {
     const ox = origin ? origin.x : cx;
     const oy = origin ? origin.y : cy;
     const extrasToPlace = hostExtras.filter((row) => !nodes.some((n) => n.host === row.label));
-    extrasToPlace.slice(0, 12).forEach((row, j) => {
+    extrasToPlace.slice(0, maxFocusExtra).forEach((row, j) => {
       const meta = hostMeta(row.label);
-      const [ex, ey] = outwardPolar(ox, oy, cx, cy, 64, j, Math.min(extrasToPlace.length, 12));
+      const [ex, ey] = polar(ox, oy, 88, j, Math.min(extrasToPlace.length, maxFocusExtra));
       nodes.push({
-        x: ex, y: ey, r: 8,
+        x: ex, y: ey, r: 11,
         cls: meta.role === "server" ? "hop-host server" : "hop-host",
         kind: "hop-host",
         key: `host:${row.label}`,
         host: row.label,
         label: meta.short,
         title: `${meta.name}\n${row.label}\n${meta.ip}\nvia ${(row.via || []).map((a) => a.account).join(", ")}`,
+        ...outerLabel(ex, ey, ox, oy, 11),
       });
     });
     hostExtras.forEach((row) => {
       const target = nodes.find((n) => n.host === row.label);
       if (!target) return;
-      lines.push(`<line x1="${ox}" y1="${oy}" x2="${target.x}" y2="${target.y}" class="edge hop" />`);
+      lines.push(`<line x1="${ox}" y1="${oy}" x2="${target.x}" y2="${target.y}" class="edge hop active" />`);
     });
   }
 
   nodes.push({
-    x: cx, y: cy, r: 28, cls: "compromised",
+    x: cx, y: cy, r: 32, cls: "compromised",
     kind: "compromised",
     key: "compromised",
-    label: shortLabel(adminDisplayName(admin), 16),
+    label: shortLabel(adminDisplayName(admin), 18),
     title: `${adminDisplayName(admin)}\n${admin.kind}\n${admin.host_count} hosts`,
+    lx: cx,
+    ly: cy + 50,
   });
 
   svg.innerHTML = `
-    <rect class="graph-bg" width="920" height="540" fill="#0f1419" />
+    <defs>
+      <filter id="node-glow" x="-50%" y="-50%" width="200%" height="200%">
+        <feGaussianBlur stdDeviation="3" result="blur" />
+        <feMerge>
+          <feMergeNode in="blur" />
+          <feMergeNode in="SourceGraphic" />
+        </feMerge>
+      </filter>
+    </defs>
+    <rect class="graph-bg" width="1000" height="680" fill="#121820" />
     <g class="lateral-scene">
+      <circle cx="${cx}" cy="${cy}" r="140" class="ring" />
+      <circle cx="${cx}" cy="${cy}" r="255" class="ring" />
+      <circle cx="${cx}" cy="${cy}" r="370" class="ring" />
+      <circle cx="${cx}" cy="${cy}" r="470" class="ring" />
       ${lines.join("")}
       ${nodes.map((n) => {
         const isLit = !dimmed || n.kind === "compromised" || lit.has(n.key);
@@ -902,24 +1021,29 @@ function drawLateral(admin) {
         return `
       <g class="g-node${isLit ? "" : " dim"}${focused ? " focused" : ""}" data-kind="${escapeHtml(n.kind || "")}" data-host="${escapeHtml(n.host || "")}" data-account="${escapeHtml(n.account || "")}">
         <title>${escapeHtml(n.title)}</title>
-        <circle cx="${n.x}" cy="${n.y}" r="${n.r + 10}" class="hit" />
-        <circle cx="${n.x}" cy="${n.y}" r="${n.r}" class="node ${n.cls}" />
-        <text x="${n.x}" y="${n.y + n.r + 12}" class="node-label">
-          <tspan x="${n.x}" dy="0">${escapeHtml(n.label)}</tspan>
-          ${n.sub ? `<tspan x="${n.x}" dy="11" class="node-sub">${escapeHtml(n.sub)}</tspan>` : ""}
+        <circle cx="${n.x}" cy="${n.y}" r="${n.r + 12}" class="hit" />
+        <circle cx="${n.x}" cy="${n.y}" r="${n.r}" class="node ${n.cls}"${focused ? ` filter="url(#node-glow)"` : ""} />
+        <text x="${n.lx}" y="${n.ly}" class="node-label">
+          <tspan x="${n.lx}" dy="0">${escapeHtml(n.label)}</tspan>
+          ${n.sub ? `<tspan x="${n.lx}" dy="13" class="node-sub${n.kind === "hop3-account" ? " hop3" : ""}">${escapeHtml(n.sub)}</tspan>` : ""}
         </text>
       </g>`;
       }).join("")}
     </g>
   `;
+
   applyLateralView();
-  renderFocusPanel(admin, hops, hiddenWks);
-  $("lateral-hops").querySelectorAll(".hop-row").forEach((row) => {
-    row.addEventListener("click", () => {
-      window.__lateralFocus = { type: "hop", account: row.dataset.account };
-      drawLateral(admin);
-    });
-  });
+  renderFocusPanel(admin, hops, third, hiddenWks);
+  const onHopRow = (row) => {
+    window.__lateralFocus = {
+      type: "hop",
+      account: row.dataset.account,
+      depth: Number(row.dataset.depth) || 2,
+    };
+    drawLateral(admin);
+  };
+  $("lateral-hops").querySelectorAll(".hop-row").forEach((row) => row.addEventListener("click", () => onHopRow(row)));
+  $("lateral-hops3").querySelectorAll(".hop-row").forEach((row) => row.addEventListener("click", () => onHopRow(row)));
   $("lateral-focus").querySelectorAll(".presence-row").forEach((row) => {
     row.addEventListener("click", () => {
       window.__lateralFocus = { type: "host", label: row.dataset.host };
