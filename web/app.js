@@ -130,6 +130,46 @@ function renderHotel(data) {
       </div>
     </div>
 
+    <div class="card lateral-card">
+      <h2>Lateral movement</h2>
+      <div class="toolbar">
+        <label class="muted" for="lateral-account">If this account is compromised</label>
+        <select id="lateral-account"></select>
+        <label class="switch" title="Administrator, AdminDevice, and AdminIT use unique rotating passwords, so they are not treated as dump-and-reuse paths.">
+          <input type="checkbox" id="lateral-exclude-rotating" ${excludeRotatingLocals() ? "checked" : ""} />
+          <span class="switch-ui"></span>
+          <span>Exclude rotating locals</span>
+        </label>
+        <span class="muted" id="lateral-summary"></span>
+      </div>
+      <div class="lateral-layout">
+        <div class="graph-wrap">
+          <div class="graph-nav">
+            <button type="button" id="lateral-zoom-in" title="Zoom in">+</button>
+            <button type="button" id="lateral-zoom-out" title="Zoom out">−</button>
+            <button type="button" id="lateral-zoom-reset" title="Reset view">Reset</button>
+          </div>
+          <svg id="lateral-graph" viewBox="0 0 920 540" role="img" aria-label="Lateral movement graph"></svg>
+          <div id="lateral-tip" class="graph-tip" hidden></div>
+          <div class="graph-legend">
+            <span><i class="swatch compromised"></i> Compromised account</span>
+            <span><i class="swatch workstation"></i> Workstation</span>
+            <span><i class="swatch server"></i> Server</span>
+            <span><i class="swatch hop"></i> Extra host via dumped local</span>
+            <span class="muted">Hover a node for the computer name · click a yellow account to list its machines</span>
+          </div>
+        </div>
+        <div class="lateral-side">
+          <div class="mini-label">Blast radius</div>
+          <div id="lateral-blast" class="lateral-blast"></div>
+          <div id="lateral-focus"></div>
+          <div class="mini-label">Second hop (local hash reuse)</div>
+          <p class="muted hop-note" id="lateral-hop-note"></p>
+          <div id="lateral-hops"></div>
+        </div>
+      </div>
+    </div>
+
     <div class="tabs" id="role-tabs">
       <button type="button" class="tab active" data-role="all">All hosts</button>
       <button type="button" class="tab" data-role="workstation">Workstations (${fmt(wks.host_count)})</button>
@@ -183,6 +223,7 @@ function renderHotel(data) {
   $("hotel-view").querySelectorAll(".role-kpi").forEach((el) => {
     el.addEventListener("click", () => setRole(el.dataset.role));
   });
+  setupLateral();
   renderHostTable();
   renderAdminTable();
 }
@@ -237,6 +278,664 @@ function setRole(role) {
 
 function rolePill(role) {
   return `<span class="pill ${role}">${role === "workstation" ? "WKS" : "Server"}</span>`;
+}
+
+function adminDisplayName(admin) {
+  return admin.grouped ? admin.account : admin.name;
+}
+
+const ROTATING_LOCALS = new Set([
+  "administrator",
+  "administrateur",
+  "admindevice",
+  "adminit",
+]);
+const ROTATING_STORAGE_KEY = "lateralExcludeRotating";
+
+function localSamName(admin) {
+  return String(admin.account || admin.name || "").split("\\").pop().toLowerCase();
+}
+
+function isRotatingLocal(admin) {
+  return ROTATING_LOCALS.has(localSamName(admin));
+}
+
+function excludeRotatingLocals() {
+  try {
+    const stored = localStorage.getItem(ROTATING_STORAGE_KEY);
+    if (stored === null) return true;
+    return stored !== "0";
+  } catch {
+    return true;
+  }
+}
+
+function setExcludeRotatingLocals(on) {
+  try {
+    localStorage.setItem(ROTATING_STORAGE_KEY, on ? "1" : "0");
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+function setupLateral() {
+  const data = window.__hotel;
+  const select = $("lateral-account");
+  const ranked = [...data.unique_admins].sort((a, b) => {
+    if (a.kind === "local" && b.kind !== "local") return -1;
+    if (b.kind === "local" && a.kind !== "local") return 1;
+    return b.host_count - a.host_count;
+  });
+  window.__lateralRanked = ranked;
+  window.__lateralFocus = null;
+  resetLateralView();
+  select.innerHTML = ranked
+    .map((a, i) => {
+      const label = `${adminDisplayName(a)} · ${a.kind} · ${a.host_count} host${a.host_count === 1 ? "" : "s"}`;
+      return `<option value="${i}">${escapeHtml(label)}</option>`;
+    })
+    .join("");
+  select.onchange = () => {
+    window.__lateralFocus = null;
+    resetLateralView();
+    drawLateral(ranked[Number(select.value)]);
+  };
+  const toggle = $("lateral-exclude-rotating");
+  toggle.checked = excludeRotatingLocals();
+  toggle.onchange = () => {
+    setExcludeRotatingLocals(toggle.checked);
+    window.__lateralFocus = null;
+    drawLateral(ranked[Number(select.value)]);
+  };
+  $("lateral-zoom-in").onclick = () => zoomLateral(1.25);
+  $("lateral-zoom-out").onclick = () => zoomLateral(1 / 1.25);
+  $("lateral-zoom-reset").onclick = () => {
+    resetLateralView();
+    applyLateralView();
+  };
+  bindLateralNav($("lateral-graph"));
+  drawLateral(ranked[0]);
+}
+
+function hostByLabel(label) {
+  const data = window.__hotel;
+  return data.hosts.find((h) => (h.dns || h.netbios || h.ip) === label);
+}
+
+function hostMeta(label) {
+  const host = hostByLabel(label) || {};
+  const dns = host.dns || "";
+  const netbios = host.netbios || "";
+  const name = netbios || dns.split(".")[0] || host.ip || String(label || "");
+  return {
+    label,
+    role: host.role || "workstation",
+    ip: host.ip || "",
+    dns,
+    netbios,
+    name,
+    short: shortLabel(name, 22),
+  };
+}
+
+function polar(cx, cy, radius, index, total) {
+  const angle = -Math.PI / 2 + (2 * Math.PI * index) / Math.max(total, 1);
+  return [cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)];
+}
+
+function outwardPolar(hx, hy, cx, cy, radius, index, total) {
+  const base = Math.atan2(hy - cy, hx - cx);
+  const span = Math.min(Math.PI * 0.9, 0.7 * Math.max(total, 1));
+  const angle = total === 1 ? base : base - span / 2 + (span * index) / Math.max(total - 1, 1);
+  return [hx + radius * Math.cos(angle), hy + radius * Math.sin(angle)];
+}
+
+function shortLabel(text, max = 22) {
+  const s = String(text || "");
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + "…";
+}
+
+function dumpableLocals(except) {
+  const skipRotating = excludeRotatingLocals();
+  return window.__hotel.unique_admins.filter((a) => {
+    if (a === except) return false;
+    if (a.kind !== "local") return false;
+    if (skipRotating && isRotatingLocal(a)) return false;
+    return true;
+  });
+}
+
+function extraHostsFromHost(label, except) {
+  const extras = new Map();
+  for (const admin of dumpableLocals(except)) {
+    if (!(admin.hosts || []).includes(label)) continue;
+    for (const h of admin.hosts || []) {
+      if (h === label) continue;
+      if (!extras.has(h)) extras.set(h, { label: h, via: [] });
+      extras.get(h).via.push(admin);
+    }
+  }
+  return [...extras.values()].sort((a, b) => b.via.length - a.via.length || a.label.localeCompare(b.label));
+}
+
+function secondHops(compromised) {
+  const direct = new Set(compromised.hosts || []);
+  const hops = [];
+  for (const other of dumpableLocals(compromised)) {
+    const overlap = (other.hosts || []).some((h) => direct.has(h));
+    if (!overlap) continue;
+    const extra = (other.hosts || []).filter((h) => !direct.has(h));
+    if (!extra.length) continue;
+    hops.push({ admin: other, extra, origin: (other.hosts || []).filter((h) => direct.has(h)) });
+  }
+  hops.sort((a, b) => b.extra.length - a.extra.length);
+  return hops;
+}
+
+function lateralViewState() {
+  if (!window.__lateralView) window.__lateralView = { x: 0, y: 0, k: 1 };
+  return window.__lateralView;
+}
+
+function resetLateralView() {
+  window.__lateralView = { x: 0, y: 0, k: 1 };
+}
+
+function applyLateralView() {
+  const scene = $("lateral-graph") && $("lateral-graph").querySelector(".lateral-scene");
+  if (!scene) return;
+  const { x, y, k } = lateralViewState();
+  scene.setAttribute("transform", `matrix(${k} 0 0 ${k} ${x} ${y})`);
+}
+
+function svgPoint(svg, clientX, clientY) {
+  const ctm = svg.getScreenCTM();
+  if (!ctm) return [0, 0];
+  const pt = new DOMPoint(clientX, clientY).matrixTransform(ctm.inverse());
+  return [pt.x, pt.y];
+}
+
+function zoomLateral(factor, clientX, clientY) {
+  const svg = $("lateral-graph");
+  if (!svg) return;
+  const view = lateralViewState();
+  const vb = svg.viewBox.baseVal;
+  const [mx, my] = clientX == null
+    ? [vb.width / 2, vb.height / 2]
+    : svgPoint(svg, clientX, clientY);
+  const wx = (mx - view.x) / view.k;
+  const wy = (my - view.y) / view.k;
+  view.k = Math.min(8, Math.max(0.4, view.k * factor));
+  view.x = mx - wx * view.k;
+  view.y = my - wy * view.k;
+  applyLateralView();
+}
+
+function bindLateralNav(svg) {
+  let pan = null;
+  let moved = false;
+  svg.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    zoomLateral(e.deltaY < 0 ? 1.12 : 1 / 1.12, e.clientX, e.clientY);
+  }, { passive: false });
+  svg.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    pan = { id: e.pointerId, x: e.clientX, y: e.clientY, vx: lateralViewState().x, vy: lateralViewState().y };
+    moved = false;
+    svg.setPointerCapture(e.pointerId);
+    svg.classList.add("is-panning");
+  });
+  svg.addEventListener("pointermove", (e) => {
+    if (!pan || e.pointerId !== pan.id) {
+      showLateralTip(svg, e);
+      if (!pan) return;
+    }
+    const dx = e.clientX - pan.x;
+    const dy = e.clientY - pan.y;
+    if (Math.hypot(dx, dy) > 4) moved = true;
+    const scale = svg.viewBox.baseVal.width / Math.max(svg.clientWidth, 1);
+    const view = lateralViewState();
+    view.x = pan.vx + dx * scale;
+    view.y = pan.vy + dy * scale;
+    applyLateralView();
+    hideLateralTip();
+  });
+  const endPan = (e) => {
+    if (!pan || e.pointerId !== pan.id) return;
+    window.__lateralPanned = moved;
+    pan = null;
+    svg.classList.remove("is-panning");
+  };
+  svg.addEventListener("pointerup", endPan);
+  svg.addEventListener("pointercancel", endPan);
+  svg.addEventListener("pointerleave", hideLateralTip);
+  svg.addEventListener("click", (e) => {
+    hideLateralTip();
+    if (window.__lateralPanned) {
+      window.__lateralPanned = false;
+      return;
+    }
+    const node = e.target.closest(".g-node");
+    if (!node || !svg.contains(node)) {
+      if (window.__lateralFocus) {
+        window.__lateralFocus = null;
+        drawLateral(window.__lateralAdmin);
+      }
+      return;
+    }
+    onLateralNodeClick(node.dataset);
+  });
+}
+
+function hideLateralTip() {
+  const tip = $("lateral-tip");
+  if (tip) tip.hidden = true;
+}
+
+function showLateralTip(svg, e) {
+  const tip = $("lateral-tip");
+  if (!tip) return;
+  const node = e.target.closest(".g-node");
+  if (!node || !svg.contains(node)) {
+    tip.hidden = true;
+    return;
+  }
+  const kind = node.dataset.kind;
+  let html = "";
+  if (kind === "host" || kind === "hop-host") {
+    const meta = hostMeta(node.dataset.host);
+    const account = node.dataset.account;
+    html = `
+      <div class="mono strong">${escapeHtml(meta.name)}</div>
+      ${meta.dns ? `<div class="muted">${escapeHtml(meta.dns)}</div>` : ""}
+      <div>${meta.role === "server" ? "Server" : "Workstation"}${meta.ip ? ` · ${escapeHtml(meta.ip)}` : ""}</div>
+      <div class="muted">${account
+        ? `Also has local account ${escapeHtml(account)}`
+        : `Has ${escapeHtml(adminDisplayName(window.__lateralAdmin))} as local admin`}</div>
+    `;
+  } else if (kind === "hop-account" || kind === "hop-cluster") {
+    const hopAdmin = (window.__hotel.unique_admins || []).find(
+      (a) => a.kind === "local" && a.account === node.dataset.account
+    );
+    const hosts = (hopAdmin && hopAdmin.hosts) || [];
+    html = `
+      <div class="mono strong">${escapeHtml(node.dataset.account)}</div>
+      <div>Local account on ${fmt(hosts.length)} computer${hosts.length === 1 ? "" : "s"}</div>
+      <div class="muted">Click to list every machine this name appears on.</div>
+    `;
+  } else if (kind === "compromised") {
+    const admin = window.__lateralAdmin;
+    html = `
+      <div class="mono strong">${escapeHtml(adminDisplayName(admin))}</div>
+      <div>Compromised account · ${fmt((admin.hosts || []).length)} computers</div>
+    `;
+  }
+  if (!html) {
+    tip.hidden = true;
+    return;
+  }
+  tip.innerHTML = html;
+  tip.hidden = false;
+  const wrap = svg.parentElement.getBoundingClientRect();
+  const x = e.clientX - wrap.left + 14;
+  const y = e.clientY - wrap.top + 14;
+  tip.style.left = `${Math.min(x, wrap.width - 220)}px`;
+  tip.style.top = `${Math.min(y, wrap.height - 90)}px`;
+}
+
+function onLateralNodeClick(dataset) {
+  const kind = dataset.kind;
+  if (kind === "compromised") {
+    window.__lateralFocus = null;
+    drawLateral(window.__lateralAdmin);
+    return;
+  }
+  if (kind === "hop-account" || kind === "hop-cluster") {
+    window.__lateralFocus = { type: "hop", account: dataset.account };
+    drawLateral(window.__lateralAdmin);
+    return;
+  }
+  if (kind === "host" || kind === "hop-host") {
+    window.__lateralFocus = { type: "host", label: dataset.host };
+    drawLateral(window.__lateralAdmin);
+    return;
+  }
+  if (kind === "wks-cluster") {
+    window.__lateralFocus = { type: "wks-cluster" };
+    drawLateral(window.__lateralAdmin);
+  }
+}
+
+function renderFocusPanel(admin, hops, hiddenWks) {
+  const focus = window.__lateralFocus;
+  const box = $("lateral-focus");
+  if (!focus) {
+    box.innerHTML = `
+      <div class="mini-label">This account is on</div>
+      <p class="muted hop-note">${escapeHtml(adminDisplayName(admin))} is in the local Administrators group on these computers.</p>
+      ${hostPresenceTable(admin.hosts || [])}
+    `;
+    return;
+  }
+  if (focus.type === "hop") {
+    const hop = hops.find((h) => h.admin.account === focus.account);
+    if (!hop) {
+      box.innerHTML = "";
+      return;
+    }
+    box.innerHTML = `
+      <div class="mini-label">This account is on</div>
+      <div class="focus-head mono">${escapeHtml(hop.admin.account)}</div>
+      <p class="muted hop-note">Same local name on the machines below. Dump it from a reached host, then reuse it where it already exists.</p>
+      <div class="mini-label">Dumped from (already reached)</div>
+      ${hostPresenceTable(hop.origin)}
+      <div class="mini-label">Also local admin on</div>
+      ${hostPresenceTable(hop.extra)}
+      <button type="button" class="linkish" id="focus-set-compromised">Set as compromised account</button>
+    `;
+    $("focus-set-compromised").onclick = () => selectLateralAdmin(hop.admin);
+    return;
+  }
+  if (focus.type === "host") {
+    const meta = hostMeta(focus.label);
+    const extras = extraHostsFromHost(focus.label, admin);
+    const locals = dumpableLocals(admin).filter((a) => (a.hosts || []).includes(focus.label));
+    box.innerHTML = `
+      <div class="mini-label">This computer</div>
+      <div class="focus-head mono">${escapeHtml(meta.name)}</div>
+      ${meta.dns ? `<div class="muted tiny">${escapeHtml(meta.dns)}</div>` : ""}
+      <div class="muted">${meta.role === "server" ? "Server" : "Workstation"}${meta.ip ? ` · ${escapeHtml(meta.ip)}` : ""}</div>
+      <div class="mini-label">Local accounts on it</div>
+      ${locals.length
+        ? `<ul class="account-on-host">${locals.map((a) => {
+            const n = (a.hosts || []).length;
+            return `<li><span class="mono">${escapeHtml(a.account)}</span> <span class="muted">on ${fmt(n)} computer${n === 1 ? "" : "s"}</span></li>`;
+          }).join("")}</ul>`
+        : `<div class="muted">No other dumpable local accounts on this machine.</div>`}
+      <div class="mini-label">Those accounts also exist on</div>
+      ${hostPresenceTable(extras)}
+    `;
+    return;
+  }
+  if (focus.type === "wks-cluster") {
+    box.innerHTML = `
+      <div class="mini-label">More workstations</div>
+      <p class="muted hop-note">${fmt(hiddenWks.length)} additional workstations with this account.</p>
+      ${hostPresenceTable(hiddenWks.map((h) => h.label))}
+    `;
+  }
+}
+
+function hostPresenceTable(items) {
+  const rows = (items || []).map((item) => {
+    if (typeof item === "string") return { meta: hostMeta(item), via: [] };
+    return { meta: hostMeta(item.label), via: item.via || [] };
+  }).sort((a, b) => {
+    if (a.meta.role !== b.meta.role) return a.meta.role === "server" ? -1 : 1;
+    return a.meta.name.localeCompare(b.meta.name, undefined, { sensitivity: "base" });
+  });
+  if (!rows.length) return `<div class="muted">No computers.</div>`;
+  const showVia = rows.some((r) => r.via.length);
+  return `<table class="presence-table">
+    <thead><tr><th>Computer</th><th>Role</th><th>IP</th>${showVia ? "<th>Via</th>" : ""}</tr></thead>
+    <tbody>
+      ${rows.map((row) => `
+        <tr class="hop-row presence-row" data-host="${escapeHtml(row.meta.label)}">
+          <td>
+            <div class="mono">${escapeHtml(row.meta.name)}</div>
+            ${row.meta.dns && row.meta.dns.toLowerCase() !== row.meta.name.toLowerCase()
+              ? `<div class="muted tiny">${escapeHtml(row.meta.dns)}</div>` : ""}
+          </td>
+          <td>${rolePill(row.meta.role)}</td>
+          <td class="mono muted">${escapeHtml(row.meta.ip || "—")}</td>
+          ${showVia ? `<td class="muted">${row.via.length ? escapeHtml(row.via.map((a) => a.account).join(", ")) : "—"}</td>` : ""}
+        </tr>
+      `).join("")}
+    </tbody>
+  </table>`;
+}
+
+function drawLateral(admin) {
+  if (!admin) return;
+  window.__lateralAdmin = admin;
+  const data = window.__hotel;
+  const hops = secondHops(admin);
+  const directHosts = (admin.hosts || []).map(hostMeta);
+  const servers = directHosts.filter((h) => h.role === "server");
+  const workstations = directHosts.filter((h) => h.role !== "server");
+  const extraHostSet = new Set();
+  hops.forEach((h) => h.extra.forEach((x) => extraHostSet.add(x)));
+  const extraCount = extraHostSet.size;
+  const pct = data.host_count ? Math.round((directHosts.length / data.host_count) * 100) : 0;
+  const focus = window.__lateralFocus;
+
+  $("lateral-summary").textContent = `${fmt(directHosts.length)} hosts reached (${pct}% of site)`;
+  $("lateral-hop-note").textContent = excludeRotatingLocals()
+    ? "If the attacker dumps SAM/LSA on a reached host, other local accounts that also appear elsewhere can extend the path. Administrator, AdminDevice, and AdminIT are excluded — they use unique rotating passwords."
+    : "If the attacker dumps SAM/LSA on a reached host, other local accounts that also appear elsewhere can extend the path. Assumes the same local name reuses a password or hash.";
+  $("lateral-blast").innerHTML = `
+    <div class="blast-line"><strong>${fmt(directHosts.length)}</strong> hosts with this account as local admin</div>
+    <div class="blast-line">${fmt(workstations.length)} workstations · ${fmt(servers.length)} servers</div>
+    <div class="blast-line">${fmt(extraCount)} additional host${extraCount === 1 ? "" : "s"} reachable if a local hash is dumped and reused</div>
+  `;
+  $("lateral-hops").innerHTML = hops.length
+    ? `<table>
+        <thead><tr><th>Local account</th><th>Extra hosts</th></tr></thead>
+        <tbody>
+          ${hops.slice(0, 12).map((h) => `
+            <tr class="hop-row${focus && focus.type === "hop" && focus.account === h.admin.account ? " selected" : ""}" data-account="${escapeHtml(h.admin.account)}">
+              <td class="mono">${escapeHtml(h.admin.account)}</td>
+              <td>${fmt(h.extra.length)}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+      ${hops.length > 12 ? `<div class="muted">Showing 12 of ${fmt(hops.length)} dump-and-reuse paths.</div>` : ""}`
+    : `<div class="muted">No extra hosts. Other local accounts on these machines are not reused outside this blast radius.</div>`;
+
+  const svg = $("lateral-graph");
+  const cx = 390;
+  const cy = 270;
+  const maxWks = 40;
+  const shownWks = workstations.slice(0, maxWks);
+  const hiddenWks = workstations.slice(maxWks);
+  const extraShown = hops.slice(0, 6);
+
+  const lit = new Set();
+  let hostExtras = [];
+  if (focus && focus.type === "hop") {
+    const hop = hops.find((h) => h.admin.account === focus.account);
+    if (hop) {
+      lit.add(`account:${hop.admin.account}`);
+      hop.extra.forEach((h) => lit.add(`host:${h}`));
+      hop.origin.forEach((h) => lit.add(`host:${h}`));
+    }
+  } else if (focus && focus.type === "host") {
+    lit.add(`host:${focus.label}`);
+    hostExtras = extraHostsFromHost(focus.label, admin);
+    hostExtras.forEach((row) => {
+      lit.add(`host:${row.label}`);
+      row.via.forEach((a) => lit.add(`account:${a.account}`));
+    });
+    dumpableLocals(admin)
+      .filter((a) => (a.hosts || []).includes(focus.label))
+      .forEach((a) => lit.add(`account:${a.account}`));
+  } else if (focus && focus.type === "wks-cluster") {
+    hiddenWks.forEach((h) => lit.add(`host:${h.label}`));
+    lit.add("wks-cluster");
+  }
+
+  const dimmed = Boolean(focus && lit.size);
+  const lines = [];
+  const nodes = [];
+
+  extraShown.forEach((hop, i) => {
+    const [x, y] = polar(cx, cy, 290, i, extraShown.length);
+    const hopLit = !dimmed || lit.has(`account:${hop.admin.account}`);
+    lines.push(`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge hop${hopLit ? "" : " dim"}" />`);
+    nodes.push({
+      x, y, r: 12, cls: "hop-account",
+      kind: "hop-account",
+      key: `account:${hop.admin.account}`,
+      account: hop.admin.account,
+      label: hop.admin.account,
+      sub: `+${hop.extra.length} extra`,
+      title: `${hop.admin.account} is a local admin on ${hop.origin.length} reached computer(s) and ${hop.extra.length} more`,
+    });
+  });
+
+  if (focus && focus.type === "hop") {
+    const hop = extraShown.find((h) => h.admin.account === focus.account)
+      || hops.find((h) => h.admin.account === focus.account);
+    const hopNode = nodes.find((n) => n.kind === "hop-account" && n.account === focus.account);
+    if (hop && hopNode) {
+      hop.extra.forEach((label, j) => {
+        const meta = hostMeta(label);
+        const [ex, ey] = outwardPolar(hopNode.x, hopNode.y, cx, cy, 72, j, hop.extra.length);
+        lines.push(`<line x1="${hopNode.x}" y1="${hopNode.y}" x2="${ex}" y2="${ey}" class="edge hop" />`);
+        nodes.push({
+          x: ex, y: ey, r: 9,
+          cls: meta.role === "server" ? "hop-host server" : "hop-host",
+          kind: "hop-host",
+          key: `host:${label}`,
+          host: label,
+          account: hop.admin.account,
+          label: meta.short,
+          title: `${meta.name}\n${label}\n${meta.ip}\n${meta.role}`,
+        });
+      });
+    }
+  }
+
+  servers.forEach((h, i) => {
+    const [x, y] = polar(cx, cy, 118, i, Math.max(servers.length, 1));
+    lines.push(`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge${!dimmed || lit.has(`host:${h.label}`) ? "" : " dim"}" />`);
+    nodes.push({
+      x, y, r: 12, cls: "server",
+      kind: "host",
+      key: `host:${h.label}`,
+      host: h.label,
+      label: h.short,
+      title: `${h.name}\n${h.dns || h.label}\n${h.ip}\nserver`,
+    });
+  });
+
+  shownWks.forEach((h, i) => {
+    const [x, y] = polar(cx, cy, 208, i, shownWks.length + (hiddenWks.length ? 1 : 0));
+    lines.push(`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge${!dimmed || lit.has(`host:${h.label}`) ? "" : " dim"}" />`);
+    nodes.push({
+      x, y, r: 8, cls: "workstation",
+      kind: "host",
+      key: `host:${h.label}`,
+      host: h.label,
+      label: h.short,
+      title: `${h.name}\n${h.dns || h.label}\n${h.ip}\nworkstation`,
+    });
+  });
+  if (hiddenWks.length) {
+    const [x, y] = polar(cx, cy, 208, shownWks.length, shownWks.length + 1);
+    lines.push(`<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge${!dimmed || lit.has("wks-cluster") ? "" : " dim"}" />`);
+    nodes.push({
+      x, y, r: 16, cls: "workstation cluster",
+      kind: "wks-cluster",
+      key: "wks-cluster",
+      label: `+${hiddenWks.length} WKS`,
+      title: `${hiddenWks.length} more workstations`,
+    });
+  }
+
+  if (focus && focus.type === "hop") {
+    const hopNode = nodes.find((n) => n.kind === "hop-account" && n.account === focus.account);
+    const hop = hops.find((h) => h.admin.account === focus.account);
+    if (hopNode && hop) {
+      hop.origin.forEach((label) => {
+        const origin = nodes.find((n) => n.host === label && n.kind === "host");
+        if (!origin) return;
+        lines.push(`<line x1="${origin.x}" y1="${origin.y}" x2="${hopNode.x}" y2="${hopNode.y}" class="edge hop" />`);
+      });
+    }
+  }
+
+  if (focus && focus.type === "host") {
+    const origin = nodes.find((n) => n.host === focus.label && n.kind === "host")
+      || nodes.find((n) => n.host === focus.label);
+    const ox = origin ? origin.x : cx;
+    const oy = origin ? origin.y : cy;
+    const extrasToPlace = hostExtras.filter((row) => !nodes.some((n) => n.host === row.label));
+    extrasToPlace.slice(0, 12).forEach((row, j) => {
+      const meta = hostMeta(row.label);
+      const [ex, ey] = outwardPolar(ox, oy, cx, cy, 64, j, Math.min(extrasToPlace.length, 12));
+      nodes.push({
+        x: ex, y: ey, r: 8,
+        cls: meta.role === "server" ? "hop-host server" : "hop-host",
+        kind: "hop-host",
+        key: `host:${row.label}`,
+        host: row.label,
+        label: meta.short,
+        title: `${meta.name}\n${row.label}\n${meta.ip}\nvia ${(row.via || []).map((a) => a.account).join(", ")}`,
+      });
+    });
+    hostExtras.forEach((row) => {
+      const target = nodes.find((n) => n.host === row.label);
+      if (!target) return;
+      lines.push(`<line x1="${ox}" y1="${oy}" x2="${target.x}" y2="${target.y}" class="edge hop" />`);
+    });
+  }
+
+  nodes.push({
+    x: cx, y: cy, r: 28, cls: "compromised",
+    kind: "compromised",
+    key: "compromised",
+    label: shortLabel(adminDisplayName(admin), 16),
+    title: `${adminDisplayName(admin)}\n${admin.kind}\n${admin.host_count} hosts`,
+  });
+
+  svg.innerHTML = `
+    <rect class="graph-bg" width="920" height="540" fill="#0f1419" />
+    <g class="lateral-scene">
+      ${lines.join("")}
+      ${nodes.map((n) => {
+        const isLit = !dimmed || n.kind === "compromised" || lit.has(n.key);
+        const focused = (focus && focus.type === "host" && n.host === focus.label)
+          || (focus && focus.type === "hop" && n.account === focus.account && n.kind !== "hop-host");
+        return `
+      <g class="g-node${isLit ? "" : " dim"}${focused ? " focused" : ""}" data-kind="${escapeHtml(n.kind || "")}" data-host="${escapeHtml(n.host || "")}" data-account="${escapeHtml(n.account || "")}">
+        <title>${escapeHtml(n.title)}</title>
+        <circle cx="${n.x}" cy="${n.y}" r="${n.r + 10}" class="hit" />
+        <circle cx="${n.x}" cy="${n.y}" r="${n.r}" class="node ${n.cls}" />
+        <text x="${n.x}" y="${n.y + n.r + 12}" class="node-label">
+          <tspan x="${n.x}" dy="0">${escapeHtml(n.label)}</tspan>
+          ${n.sub ? `<tspan x="${n.x}" dy="11" class="node-sub">${escapeHtml(n.sub)}</tspan>` : ""}
+        </text>
+      </g>`;
+      }).join("")}
+    </g>
+  `;
+  applyLateralView();
+  renderFocusPanel(admin, hops, hiddenWks);
+  $("lateral-hops").querySelectorAll(".hop-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      window.__lateralFocus = { type: "hop", account: row.dataset.account };
+      drawLateral(admin);
+    });
+  });
+  $("lateral-focus").querySelectorAll(".presence-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      window.__lateralFocus = { type: "host", label: row.dataset.host };
+      drawLateral(admin);
+    });
+  });
+}
+
+function selectLateralAdmin(admin) {
+  const ranked = window.__lateralRanked || [];
+  const idx = ranked.indexOf(admin);
+  if (idx < 0 || !$("lateral-account")) return;
+  $("lateral-account").value = String(idx);
+  window.__lateralFocus = null;
+  resetLateralView();
+  drawLateral(admin);
 }
 
 function presencePill(presence) {
@@ -347,9 +1046,11 @@ function renderAdminTable() {
       $("admin-table").querySelectorAll(".detail-row").forEach((d) => (d.hidden = true));
       $("admin-table").querySelectorAll(".admin-row").forEach((r) => r.classList.remove("selected"));
       if (!open) {
-        detail.querySelector(".detail").innerHTML = adminHostDetail(window.__adminRows[Number(i)]);
+        const admin = window.__adminRows[Number(i)];
+        detail.querySelector(".detail").innerHTML = adminHostDetail(admin);
         detail.hidden = false;
         row.classList.add("selected");
+        selectLateralAdmin(admin);
       }
     });
   });

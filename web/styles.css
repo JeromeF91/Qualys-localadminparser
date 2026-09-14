@@ -192,8 +192,158 @@ tr.selected { background: #22303b; }
 .split-hosts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .split-hosts ul { margin: 6px 0 0; padding-left: 18px; }
 .mini-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 650; }
-tr.admin-row { cursor: pointer; }
-tr.admin-row:hover { background: #1f2832; }
+.lateral-card { margin-bottom: 16px; }
+.lateral-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  min-height: 540px;
+}
+@media (max-width: 900px) {
+  .lateral-layout { grid-template-columns: 1fr; }
+}
+.graph-wrap { border-right: 1px solid var(--stroke); position: relative; overflow: hidden; }
+#lateral-graph {
+  width: 100%;
+  height: 540px;
+  display: block;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+#lateral-graph.is-panning { cursor: grabbing; }
+.graph-nav {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  display: flex;
+  gap: 6px;
+  z-index: 2;
+}
+.graph-nav button {
+  background: #1d2630;
+  color: var(--text);
+  border: 1px solid var(--stroke);
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1.2;
+}
+.graph-nav button:hover { border-color: var(--accent); color: var(--accent); }
+.g-node { cursor: pointer; }
+.g-node.dim { opacity: 0.18; }
+.g-node.focused .node { stroke: #e8eef4; stroke-width: 3; }
+.edge.dim { opacity: 0.12; }
+.hit { fill: transparent; }
+#lateral-focus { margin: 0 0 16px; }
+.focus-head { margin: 4px 0 6px; font-weight: 650; }
+.impact-table { margin: 8px 0 10px; }
+.graph-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 8px 16px 14px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.graph-legend .swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 99px;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.swatch.compromised { background: var(--accent); }
+.swatch.workstation { background: #4d8f82; }
+.swatch.server { background: #9db0d4; }
+.swatch.hop { background: var(--danger); }
+.node-label {
+  fill: var(--muted);
+  font-size: 10px;
+  text-anchor: middle;
+  font-family: inherit;
+  pointer-events: none;
+}
+.node-sub { fill: var(--danger); font-size: 9px; }
+.graph-tip {
+  position: absolute;
+  z-index: 5;
+  max-width: 280px;
+  padding: 8px 10px;
+  background: #1d2630;
+  border: 1px solid var(--stroke);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  pointer-events: none;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.graph-tip .strong { font-weight: 650; margin-bottom: 2px; }
+.tiny { font-size: 11px; }
+.presence-table { margin: 8px 0 14px; }
+.presence-table td { vertical-align: top; }
+.account-on-host {
+  margin: 6px 0 14px;
+  padding-left: 18px;
+  font-size: 13px;
+}
+.lateral-side { padding: 14px 16px 16px; overflow: auto; max-height: 640px; }
+.lateral-blast { margin: 8px 0 16px; }
+.blast-line { margin: 0 0 6px; font-size: 13px; }
+.hop-note { font-size: 12px; margin: 8px 0 10px; line-height: 1.45; }
+.hop-row { cursor: pointer; }
+.hop-row:hover { background: #1f2832; }
+#lateral-account { max-width: 420px; }
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 13px;
+  user-select: none;
+}
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.switch-ui {
+  width: 34px;
+  height: 18px;
+  border-radius: 99px;
+  background: #2a3542;
+  position: relative;
+  flex-shrink: 0;
+  transition: background 0.15s ease;
+}
+.switch-ui::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 99px;
+  background: #c5d0db;
+  transition: transform 0.15s ease;
+}
+.switch input:checked + .switch-ui { background: var(--accent); }
+.switch input:checked + .switch-ui::after {
+  transform: translateX(16px);
+  background: #06241e;
+}
+.switch input:focus-visible + .switch-ui { outline: 1px solid var(--accent); }
+.edge { stroke: #3a4654; stroke-width: 1.2; }
+.edge.hop { stroke: #8a5555; stroke-dasharray: 4 3; }
+.node { stroke: #0f1419; stroke-width: 2; }
+.node.compromised { fill: var(--accent); }
+.node.workstation { fill: #4d8f82; }
+.node.server { fill: #9db0d4; }
+.node.hop-account { fill: var(--local); }
+.node.hop-host { fill: var(--danger); }
 
 .toolbar {
   display: flex;
