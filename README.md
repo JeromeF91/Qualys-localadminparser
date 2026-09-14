@@ -22,6 +22,20 @@ python serve.py
 
 3. Open [http://127.0.0.1:8765](http://127.0.0.1:8765).
 
+## Screenshots
+
+Overview with inventory totals and the largest sites:
+
+![Overview](docs/screenshots/overview.png)
+
+Site drilldown with workstation vs server stats, hosts, and administrator identities:
+
+![Drilldown](docs/screenshots/drilldown.png)
+
+Local accounts grouped by name, with the hosts where each name is used:
+
+![Local accounts](docs/screenshots/local-accounts.png)
+
 The first run parses the XML into `cache/hosts.pkl` (about 15 seconds for a ~300 MB file). Later starts reuse that cache unless a newer XML is present.
 
 ## Refreshing the data
@@ -53,6 +67,7 @@ adminparser/
   serve.py          HTTP dashboard (port 8765)
   parse_qualys.py   XML → cache
   web/              UI
+  docs/screenshots/ README images
   cache/            generated (hosts.pkl) — do not commit
   *.xml             Qualys export(s)
 ```
