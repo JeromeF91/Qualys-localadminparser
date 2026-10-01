@@ -22,6 +22,7 @@ function pill(kind) {
 }
 
 function renderOverview(summary) {
+  const bl = summary.bitlocker || {};
   const top = summary.top_hotels
     .map((h) => {
       const max = summary.top_hotels[0].hosts;
@@ -39,10 +40,15 @@ function renderOverview(summary) {
       <div class="kpi"><div class="label">Hosts</div><div class="value">${fmt(summary.host_count)}</div><div class="sub">Qualys administrator group export</div></div>
       <div class="kpi"><div class="label">Hotel codes</div><div class="value">${fmt(summary.hotel_count)}</div><div class="sub">${fmt(summary.prefix_counts.H || 0)} H · ${fmt(summary.prefix_counts.V || 0)} V</div></div>
       <div class="kpi"><div class="label">Uncoded hosts</div><div class="value">${fmt(summary.hosts_without_code)}</div><div class="sub">No H/V + 4-char code in DNS, NetBIOS or tags</div></div>
+      <div class="kpi"><div class="label">BitLocker OS off</div><div class="value">${bl.available ? fmt((bl.os_unprotected || 0) + (bl.os_suspended || 0)) : "—"}</div>
+        <div class="sub">${bl.available
+          ? `${fmt(bl.os_unprotected)} not encrypted${bl.os_suspended ? ` · ${fmt(bl.os_suspended)} protection off` : ""} · ${fmt(bl.os_protected)} protected`
+          : "Place an XML whose filename contains bitlocker"}</div></div>
       <div class="kpi"><div class="label">Report generated</div><div class="value" style="font-size:18px;margin-top:10px">${summary.generated.replace("T", " ").replace("Z", " UTC")}</div>
         <div class="sub">${escapeHtml(summary.source || "")}</div></div>
     </div>
-    ${summary.stale ? `<p class="status">A newer XML is in the folder: ${escapeHtml(summary.latest_xml)}. Reload to parse it.</p>` : ""}
+    ${summary.stale ? `<p class="status">A newer administrator XML is in the folder: ${escapeHtml(summary.latest_xml)}. Reload to parse it.</p>` : ""}
+    ${bl.stale ? `<p class="status">A newer BitLocker XML is in the folder${bl.latest_xml ? `: ${escapeHtml(bl.latest_xml)}` : ""}. Reload to parse it.</p>` : ""}
     <div class="toolbar-inline">
       <button type="button" class="linkish" id="reload-xml">Reload from latest XML</button>
       <span class="muted" id="reload-status"></span>
@@ -53,11 +59,30 @@ function renderOverview(summary) {
         <div class="body">${top}</div>
       </div>
       <div class="card">
-        <h2>How to filter</h2>
-        <div class="empty">
-          Type a hotel code such as <span class="mono">H1401</span> or <span class="mono">V0011</span>.
-          Matching is based on DNS, NetBIOS and Qualys asset tags. Click a hotel to drill into workstation vs server statistics and the administrator accounts on each.
-        </div>
+        ${bl.available ? `
+          <h2>BitLocker by hotel</h2>
+          <div class="body">${
+            (bl.hotels || []).length
+              ? (bl.hotels || []).map((h) => {
+                  const max = Math.max(1, (bl.hotels[0] && bl.hotels[0].hosts) || 1);
+                  const pct = Math.max(6, Math.round((h.hosts / max) * 100));
+                  const off = (h.os_unprotected || 0) + (h.os_suspended || 0);
+                  return `<div class="bar-row clickable" data-code="${h.code}">
+                    <div class="name">${h.code}</div>
+                    <div class="track"><div class="fill ${off ? "unprotected" : "protected"}" style="width:${pct}%"></div></div>
+                    <div class="n wide">${fmt(off)} OS off · ${fmt(h.hosts)}</div>
+                  </div>`;
+                }).join("")
+              : `<div class="empty">BitLocker report loaded, but no hotel codes were found in it.</div>`
+          }</div>
+        ` : `
+          <h2>How to filter</h2>
+          <div class="empty">
+            Type a hotel code such as <span class="mono">H1401</span> or <span class="mono">V0011</span>.
+            Matching is based on DNS, NetBIOS and Qualys asset tags. Click a hotel to drill into workstation vs server statistics and the administrator accounts on each.
+            BitLocker review uses a separate Qualys XML whose filename contains <span class="mono">bitlocker</span>.
+          </div>
+        `}
       </div>
     </div>
   `;
@@ -66,7 +91,7 @@ function renderOverview(summary) {
   });
   $("reload-xml").onclick = async () => {
     const status = $("reload-status");
-    status.textContent = "Parsing the latest XML. This takes about 15 seconds…";
+    status.textContent = "Parsing the latest XML files. This can take about 15 seconds…";
     try {
       const res = await fetch("/api/reload", { method: "POST" });
       const data = await res.json();
@@ -86,11 +111,14 @@ function renderHotel(data) {
   $("hotel-input").value = data.code;
 
   window.__hotel = data;
-  window.__filters = { role: "all", kind: "", presence: "", query: "" };
+  window.__filters = { role: "all", kind: "", presence: "", query: "", tagLanpms: true, tagAssets: true };
+  window.__blIndex = null;
+  window.__scopedAdmins = null;
 
   const wks = data.roles.workstation;
   const srv = data.roles.server;
   const presence = data.presence_counts || {};
+  const tagCounts = tagKindCounts(data.hosts);
 
   $("hotel-view").innerHTML = `
     <div class="hotel-head">
@@ -130,54 +158,23 @@ function renderHotel(data) {
       </div>
     </div>
 
-    <div class="card lateral-card">
-      <h2>Lateral movement</h2>
-      <div class="toolbar">
-        <label class="muted" for="lateral-account">If this account is compromised</label>
-        <select id="lateral-account"></select>
-        <label class="switch" title="Administrator, AdminDevice, and AdminIT use unique rotating passwords, so they are not treated as dump-and-reuse paths.">
-          <input type="checkbox" id="lateral-exclude-rotating" ${excludeRotatingLocals() ? "checked" : ""} />
-          <span class="switch-ui"></span>
-          <span>Exclude rotating locals</span>
+    <div class="tabs-row">
+      <div class="tabs" id="role-tabs">
+        <button type="button" class="tab active" data-role="all">All hosts</button>
+        <button type="button" class="tab" data-role="workstation">Workstations (${fmt(wks.host_count)})</button>
+        <button type="button" class="tab" data-role="server">Servers (${fmt(srv.host_count)})</button>
+      </div>
+      <div class="tag-filters">
+        <span class="muted">Tags</span>
+        <label class="tag-check" title="This hotel's Qualys tags ending in LANPMS">
+          <input type="checkbox" id="tag-lanpms" checked />
+          LANPMS (${fmt(tagCounts.lanpms)})
         </label>
-        <span class="muted" id="lateral-summary"></span>
+        <label class="tag-check" title="This hotel's Qualys tags ending in Assets">
+          <input type="checkbox" id="tag-assets" checked />
+          Assets (${fmt(tagCounts.assets)})
+        </label>
       </div>
-      <div class="lateral-layout">
-        <div class="graph-wrap">
-          <div class="graph-nav">
-            <button type="button" id="lateral-zoom-in" title="Zoom in">+</button>
-            <button type="button" id="lateral-zoom-out" title="Zoom out">−</button>
-            <button type="button" id="lateral-zoom-reset" title="Reset view">Reset</button>
-          </div>
-          <svg id="lateral-graph" viewBox="0 0 1000 680" role="img" aria-label="Lateral movement graph"></svg>
-          <div id="lateral-tip" class="graph-tip" hidden></div>
-          <div class="graph-legend">
-            <span><i class="swatch compromised"></i> Compromised account</span>
-            <span><i class="swatch workstation"></i> Workstation</span>
-            <span><i class="swatch server"></i> Server</span>
-            <span><i class="swatch hop"></i> Extra host via 2nd hop</span>
-            <span><i class="swatch hop3"></i> Extra host via 3rd hop</span>
-            <span class="muted">Hover a node for the computer name · click a yellow or purple account to list its machines</span>
-          </div>
-        </div>
-        <div class="lateral-side">
-          <div class="mini-label">Blast radius</div>
-          <div id="lateral-blast" class="lateral-blast"></div>
-          <div id="lateral-focus"></div>
-          <div class="mini-label">Second hop (local hash reuse)</div>
-          <p class="muted hop-note" id="lateral-hop-note"></p>
-          <div id="lateral-hops"></div>
-          <div class="mini-label">Third hop</div>
-          <p class="muted hop-note" id="lateral-third-note"></p>
-          <div id="lateral-hops3"></div>
-        </div>
-      </div>
-    </div>
-
-    <div class="tabs" id="role-tabs">
-      <button type="button" class="tab active" data-role="all">All hosts</button>
-      <button type="button" class="tab" data-role="workstation">Workstations (${fmt(wks.host_count)})</button>
-      <button type="button" class="tab" data-role="server">Servers (${fmt(srv.host_count)})</button>
     </div>
 
     <div class="grid-2">
@@ -209,6 +206,53 @@ function renderHotel(data) {
         <div class="body" id="admin-table"></div>
       </div>
     </div>
+
+    ${bitlockerSection(data.bitlocker)}
+
+    <div class="card lateral-card">
+      <h2>Lateral movement</h2>
+      <div class="toolbar">
+        <label class="muted" for="lateral-account">If this account is compromised</label>
+        <select id="lateral-account"></select>
+        <label class="switch" title="Administrator, AdminDevice, and AdminIT use unique rotating passwords, so they are not treated as dump-and-reuse paths.">
+          <input type="checkbox" id="lateral-exclude-rotating" ${excludeRotatingLocals() ? "checked" : ""} />
+          <span class="switch-ui"></span>
+          <span>Exclude rotating locals</span>
+        </label>
+        <span class="muted" id="lateral-summary"></span>
+      </div>
+      <div class="lateral-layout">
+        <div class="graph-wrap">
+          <div class="graph-nav">
+            <button type="button" id="lateral-zoom-in" title="Zoom in">+</button>
+            <button type="button" id="lateral-zoom-out" title="Zoom out">−</button>
+            <button type="button" id="lateral-zoom-reset" title="Reset view">Reset</button>
+          </div>
+          <svg id="lateral-graph" viewBox="0 0 1000 680" role="img" aria-label="Lateral movement graph"></svg>
+          <div id="lateral-tip" class="graph-tip" hidden></div>
+          <div class="graph-legend">
+            <span><i class="swatch compromised"></i> Compromised account</span>
+            <span><i class="swatch workstation"></i> Workstation</span>
+            <span><i class="swatch server"></i> Server</span>
+            <span><i class="swatch hop"></i> Extra host via 2nd hop</span>
+            <span><i class="swatch hop3"></i> Extra host via 3rd hop</span>
+            <span><i class="swatch bl-risk"></i> No BitLocker / protection off</span>
+            <span class="muted">Hover a node for the computer name · click a yellow or purple account to list its machines</span>
+          </div>
+        </div>
+        <div class="lateral-side">
+          <div class="mini-label">Blast radius</div>
+          <div id="lateral-blast" class="lateral-blast"></div>
+          <div id="lateral-focus"></div>
+          <div class="mini-label">Second hop (local hash reuse)</div>
+          <p class="muted hop-note" id="lateral-hop-note"></p>
+          <div id="lateral-hops"></div>
+          <div class="mini-label">Third hop</div>
+          <p class="muted hop-note" id="lateral-third-note"></p>
+          <div id="lateral-hops3"></div>
+        </div>
+      </div>
+    </div>
   `;
 
   $("back").onclick = () => {
@@ -218,6 +262,14 @@ function renderHotel(data) {
   };
   $("export-csv").onclick = exportCsv;
   $("host-filter").oninput = renderHostTable;
+  $("tag-lanpms").onchange = () => {
+    window.__filters.tagLanpms = $("tag-lanpms").checked;
+    applyTagScope();
+  };
+  $("tag-assets").onchange = () => {
+    window.__filters.tagAssets = $("tag-assets").checked;
+    applyTagScope();
+  };
   $("admin-filter").oninput = renderAdminTable;
   $("kind-filter").onchange = renderAdminTable;
   $("presence-filter").onchange = renderAdminTable;
@@ -228,8 +280,221 @@ function renderHotel(data) {
     el.addEventListener("click", () => setRole(el.dataset.role));
   });
   setupLateral();
+  setupBitlocker();
   renderHostTable();
   renderAdminTable();
+}
+
+function bitlockerSection(bl) {
+  if (!bl || !bl.available) {
+    return `<div class="card bitlocker-card">
+      <h2>BitLocker</h2>
+      <div class="empty">No BitLocker Qualys export loaded. Place an XML whose filename contains <span class="mono">bitlocker</span> next to the administrator export, then reload.</div>
+    </div>`;
+  }
+  if (!bl.host_count) {
+    return `<div class="card bitlocker-card">
+      <h2>BitLocker</h2>
+      <div class="empty">No hosts for this hotel in ${escapeHtml(bl.source || "the BitLocker report")}. OS volume status is the review target; unprotected removable drives are expected.</div>
+    </div>`;
+  }
+  return `
+    <div class="card bitlocker-card">
+      <h2>BitLocker</h2>
+      <p class="bitlocker-note muted">OS volume (usually C:) is the status to review. Unprotected means the disk is not encrypted. Protection off means it is encrypted but BitLocker protectors are disabled (suspended). Unprotected removable drives are listed but not treated as a failure. Source: ${escapeHtml(bl.source || "")}</p>
+      <div class="kpis bitlocker-kpis">
+        <div class="kpi bl-kpi" data-status="all">
+          <div class="label">In report</div>
+          <div class="value">${fmt(bl.host_count)}</div>
+          <div class="sub">Hosts with QID 45437</div>
+        </div>
+        <div class="kpi bl-kpi" data-status="protected">
+          <div class="label">OS protected</div>
+          <div class="value">${fmt(bl.os_protected)}</div>
+          <div class="sub">${escapeHtml((bl.encryption_counts && bl.encryption_counts[0] && bl.encryption_counts[0][0]) || "Encryption method varies")}</div>
+        </div>
+        <div class="kpi bl-kpi" data-status="unprotected">
+          <div class="label">OS unprotected</div>
+          <div class="value">${fmt(bl.os_unprotected)}</div>
+          <div class="sub">Not encrypted</div>
+        </div>
+        <div class="kpi bl-kpi" data-status="suspended">
+          <div class="label">Protection off</div>
+          <div class="value">${fmt(bl.os_suspended || 0)}</div>
+          <div class="sub">Encrypted, protectors disabled</div>
+        </div>
+        <div class="kpi bl-kpi" data-status="encrypting">
+          <div class="label">In progress</div>
+          <div class="value">${fmt((bl.os_encrypting || 0) + (bl.os_decrypting || 0))}</div>
+          <div class="sub">${fmt(bl.unprotected_removable_hosts || 0)} with unprotected removable</div>
+        </div>
+      </div>
+      <div class="body pad">${bitlockerMix(bl)}</div>
+      <div class="toolbar">
+        <div class="tabs" id="bitlocker-tabs">
+          <button type="button" class="tab active" data-status="all">All</button>
+          <button type="button" class="tab" data-status="unprotected">OS unprotected (${fmt(bl.os_unprotected)})</button>
+          <button type="button" class="tab" data-status="suspended">Protection off (${fmt(bl.os_suspended || 0)})</button>
+          <button type="button" class="tab" data-status="protected">Protected (${fmt(bl.os_protected)})</button>
+          <button type="button" class="tab" data-status="encrypting">In progress (${fmt((bl.os_encrypting || 0) + (bl.os_decrypting || 0))})</button>
+          <button type="button" class="tab" data-status="removable">Removable (${fmt(bl.unprotected_removable_hosts || 0)})</button>
+        </div>
+        <input id="bitlocker-filter" placeholder="Filter computers" />
+        <span class="muted" id="bitlocker-count"></span>
+      </div>
+      <div class="body" id="bitlocker-table"></div>
+    </div>
+  `;
+}
+
+function bitlockerMix(bl) {
+  const total = Math.max(1, bl.host_count);
+  const rows = [
+    ["Protected", bl.os_protected || 0, "protected"],
+    ["Unprotected", bl.os_unprotected || 0, "unprotected"],
+    ["Protection off", bl.os_suspended || 0, "suspended"],
+    ["In progress", (bl.os_encrypting || 0) + (bl.os_decrypting || 0), "encrypting"],
+  ];
+  const methods = (bl.encryption_counts || [])
+    .map(([name, n]) => `<div class="os-line"><span>${escapeHtml(name)}</span><span class="muted">${fmt(n)}</span></div>`)
+    .join("");
+  return `
+    <div class="mix">
+      ${rows.map(([label, n, cls]) => `
+        <div class="mix-row">
+          <div class="mix-label">${label}</div>
+          <div class="track"><div class="fill ${cls}" style="width:${Math.round((n / total) * 100)}%"></div></div>
+          <div class="n">${fmt(n)}</div>
+        </div>
+      `).join("")}
+      <div class="muted mix-foot">${fmt(bl.host_count)} hosts in the BitLocker report</div>
+      ${methods}
+    </div>
+  `;
+}
+
+function bitlockerPill(status) {
+  const labels = {
+    protected: "Protected",
+    unprotected: "Unprotected",
+    suspended: "Protection off",
+    missing: "No BitLocker",
+    encrypting: "Encrypting",
+    decrypting: "Decrypting",
+    unknown: "Unknown",
+  };
+  return `<span class="pill ${status}">${labels[status] || status}</span>`;
+}
+
+function otherVolumeSummary(host) {
+  const osLetter = (host.os_letter || "").toUpperCase();
+  const extras = (host.volumes || []).filter((v) => (v.letter || "").toUpperCase() !== osLetter);
+  if (!extras.length) return `<span class="muted">—</span>`;
+  return extras.map((v) => {
+    const status = v.status || (v.protection === "1" ? "protected" : "unprotected");
+    return `<div>${escapeHtml(v.letter || "?")} ${escapeHtml(v.volume_type_label || "")} · ${bitlockerPill(status)}</div>`;
+  }).join("");
+}
+
+function setupBitlocker() {
+  window.__bitlockerStatus = "all";
+  const tabs = $("bitlocker-tabs");
+  if (!tabs) return;
+  const setStatus = (status) => {
+    window.__bitlockerStatus = status;
+    tabs.querySelectorAll(".tab").forEach((tab) => {
+      tab.classList.toggle("active", tab.dataset.status === status);
+    });
+    $("hotel-view").querySelectorAll(".bl-kpi").forEach((el) => {
+      el.classList.toggle("active", el.dataset.status === status);
+    });
+    renderBitlockerTable();
+  };
+  tabs.querySelectorAll(".tab").forEach((tab) => {
+    tab.addEventListener("click", () => setStatus(tab.dataset.status));
+  });
+  $("hotel-view").querySelectorAll(".bl-kpi").forEach((el) => {
+    el.addEventListener("click", () => setStatus(el.dataset.status));
+  });
+  $("bitlocker-filter").oninput = renderBitlockerTable;
+  renderBitlockerTable();
+}
+
+function renderBitlockerTable() {
+  const bl = window.__hotel && window.__hotel.bitlocker;
+  const table = $("bitlocker-table");
+  if (!bl || !table) return;
+  const status = window.__bitlockerStatus || "all";
+  const q = (($("bitlocker-filter") && $("bitlocker-filter").value) || "").toLowerCase();
+  const rows = (bl.hosts || []).filter((h) => {
+    if (status === "unprotected" && h.os_status !== "unprotected") return false;
+    if (status === "suspended" && h.os_status !== "suspended") return false;
+    if (status === "protected" && h.os_status !== "protected") return false;
+    if (status === "encrypting" && h.os_status !== "encrypting" && h.os_status !== "decrypting") return false;
+    if (status === "removable" && !h.unprotected_removable) return false;
+    const blob = `${h.ip} ${h.dns} ${h.netbios} ${h.os} ${h.os_encryption}`.toLowerCase();
+    return !q || blob.includes(q);
+  });
+  $("bitlocker-count").textContent = `${fmt(rows.length)} shown`;
+  if (!rows.length) {
+    table.innerHTML = `<div class="empty">No hosts match this BitLocker filter.</div>`;
+    return;
+  }
+  table.innerHTML = `
+    <table>
+      <thead><tr><th>Computer</th><th>Role</th><th>OS drive</th><th>Status</th><th>Encryption</th><th>Other volumes</th><th>Last found</th></tr></thead>
+      <tbody>
+        ${rows.map((h) => {
+          const idx = bl.hosts.indexOf(h);
+          return `
+          <tr class="host-row" data-bl-idx="${idx}">
+            <td>
+              <div class="mono">${escapeHtml(h.dns || h.netbios || "—")}</div>
+              <div class="muted">${escapeHtml(h.netbios || h.ip || "")}</div>
+            </td>
+            <td>${rolePill(h.role)}</td>
+            <td class="mono">${escapeHtml(h.os_letter || "—")}</td>
+            <td>${bitlockerPill(h.os_status)}</td>
+            <td>${escapeHtml(h.os_encryption || "—")}<div class="muted tiny">${escapeHtml(h.os_conversion_label || "")}</div></td>
+            <td>${otherVolumeSummary(h)}</td>
+            <td class="muted">${escapeHtml(h.last_found || "—")}</td>
+          </tr>
+          <tr class="detail-row" data-bl-for="${idx}" hidden>
+            <td colspan="7" class="detail">${volumeMiniTable(h.volumes)}</td>
+          </tr>`;
+        }).join("")}
+      </tbody>
+    </table>
+  `;
+  table.querySelectorAll(".host-row").forEach((row) => {
+    row.addEventListener("click", () => {
+      const idx = row.dataset.blIdx;
+      const detail = table.querySelector(`[data-bl-for="${idx}"]`);
+      const open = !detail.hidden;
+      table.querySelectorAll(".detail-row").forEach((d) => (d.hidden = true));
+      table.querySelectorAll(".host-row").forEach((r) => r.classList.remove("selected"));
+      if (!open) {
+        detail.hidden = false;
+        row.classList.add("selected");
+      }
+    });
+  });
+}
+
+function volumeMiniTable(volumes) {
+  if (!volumes || !volumes.length) return `<div class="muted">No volume rows in the Qualys result.</div>`;
+  return `<table>
+    <thead><tr><th>Drive</th><th>Type</th><th>Protection</th><th>Conversion</th><th>Encryption</th><th>Volume ID</th></tr></thead>
+    <tbody>${volumes.map((v) => `
+      <tr>
+        <td class="mono">${escapeHtml(v.letter || "—")}</td>
+        <td>${escapeHtml(v.volume_type_label || "—")}</td>
+        <td>${bitlockerPill(v.status || (v.protection === "1" ? "protected" : v.protection === "0" ? "unprotected" : "unknown"))}</td>
+        <td>${escapeHtml(v.conversion_label || "—")}</td>
+        <td>${escapeHtml(v.encryption_label || "—")}</td>
+        <td class="mono muted">${escapeHtml(v.volume_id || "—")}</td>
+      </tr>`).join("")}</tbody>
+  </table>`;
 }
 
 function roleMix(stats) {
@@ -323,11 +588,36 @@ function setExcludeRotatingLocals(on) {
 }
 
 function setupLateral() {
-  const data = window.__hotel;
   const select = $("lateral-account");
-  const ranked = [...data.unique_admins].sort((a, b) => {
+  if (!select) return;
+  $("lateral-zoom-in").onclick = () => zoomLateral(1.25);
+  $("lateral-zoom-out").onclick = () => zoomLateral(1 / 1.25);
+  $("lateral-zoom-reset").onclick = () => {
+    resetLateralView();
+    applyLateralView();
+  };
+  const toggle = $("lateral-exclude-rotating");
+  toggle.checked = excludeRotatingLocals();
+  toggle.onchange = () => {
+    setExcludeRotatingLocals(toggle.checked);
+    window.__lateralFocus = null;
+    const ranked = window.__lateralRanked || [];
+    drawLateral(ranked[Number($("lateral-account").value)] || ranked[0]);
+  };
+  bindLateralNav($("lateral-graph"));
+  refreshLateral();
+}
+
+function refreshLateral() {
+  const select = $("lateral-account");
+  if (!select) return;
+  const previous = window.__lateralAdmin;
+  const ranked = [...scopedUniqueAdmins()].sort((a, b) => {
     if (a.kind === "local" && b.kind !== "local") return -1;
     if (b.kind === "local" && a.kind !== "local") return 1;
+    const riskA = aggravatingCount(a.hosts);
+    const riskB = aggravatingCount(b.hosts);
+    if (riskB !== riskA) return riskB - riskA;
     return b.host_count - a.host_count;
   });
   window.__lateralRanked = ranked;
@@ -335,30 +625,21 @@ function setupLateral() {
   resetLateralView();
   select.innerHTML = ranked
     .map((a, i) => {
-      const label = `${adminDisplayName(a)} · ${a.kind} · ${a.host_count} host${a.host_count === 1 ? "" : "s"}`;
+      const risk = aggravatingCount(a.hosts);
+      const riskNote = risk ? ` · ${risk} no BitLocker` : "";
+      const label = `${adminDisplayName(a)} · ${a.kind} · ${a.host_count} host${a.host_count === 1 ? "" : "s"}${riskNote}`;
       return `<option value="${i}">${escapeHtml(label)}</option>`;
     })
     .join("");
+  const next = (previous && ranked.find((a) => adminKey(a) === adminKey(previous))) || ranked[0];
+  const idx = Math.max(0, ranked.indexOf(next));
+  select.value = String(idx);
   select.onchange = () => {
     window.__lateralFocus = null;
     resetLateralView();
     drawLateral(ranked[Number(select.value)]);
   };
-  const toggle = $("lateral-exclude-rotating");
-  toggle.checked = excludeRotatingLocals();
-  toggle.onchange = () => {
-    setExcludeRotatingLocals(toggle.checked);
-    window.__lateralFocus = null;
-    drawLateral(ranked[Number(select.value)]);
-  };
-  $("lateral-zoom-in").onclick = () => zoomLateral(1.25);
-  $("lateral-zoom-out").onclick = () => zoomLateral(1 / 1.25);
-  $("lateral-zoom-reset").onclick = () => {
-    resetLateralView();
-    applyLateralView();
-  };
-  bindLateralNav($("lateral-graph"));
-  drawLateral(ranked[0]);
+  drawLateral(next);
 }
 
 function hostByLabel(label) {
@@ -380,6 +661,72 @@ function hostMeta(label) {
     name,
     short: shortLabel(name, 22),
   };
+}
+
+function bitlockerIndex() {
+  if (window.__blIndex) return window.__blIndex;
+  const byIp = new Map();
+  const byDns = new Map();
+  const byNb = new Map();
+  const hosts = ((window.__hotel && window.__hotel.bitlocker) || {}).hosts || [];
+  for (const row of hosts) {
+    if (row.ip) byIp.set(row.ip, row);
+    if (row.dns) byDns.set(row.dns.toLowerCase(), row);
+    if (row.netbios) byNb.set(row.netbios.toLowerCase(), row);
+  }
+  window.__blIndex = { byIp, byDns, byNb };
+  return window.__blIndex;
+}
+
+function bitlockerRisk(label) {
+  const bl = window.__hotel && window.__hotel.bitlocker;
+  if (!bl || !bl.available) {
+    return { status: "unknown", aggravating: false, label: "No report" };
+  }
+  const host = hostByLabel(label) || {};
+  const idx = bitlockerIndex();
+  const row = (host.ip && idx.byIp.get(host.ip))
+    || (host.dns && idx.byDns.get(host.dns.toLowerCase()))
+    || (host.netbios && idx.byNb.get(String(host.netbios).toLowerCase()))
+    || (label && idx.byDns.get(String(label).toLowerCase()))
+    || (label && idx.byNb.get(String(label).toLowerCase()));
+  if (row) {
+    const aggravating = row.os_status !== "protected";
+    const labels = {
+      unprotected: "Not encrypted",
+      suspended: "Protection off",
+      encrypting: "Encrypting",
+      decrypting: "Decrypting",
+      protected: "Protected",
+      unknown: "Unknown",
+    };
+    return { status: row.os_status, aggravating, label: labels[row.os_status] || row.os_status, row };
+  }
+  return { status: "missing", aggravating: true, label: "No BitLocker" };
+}
+
+function aggravatingCount(labels) {
+  return (labels || []).reduce((n, label) => n + (bitlockerRisk(label).aggravating ? 1 : 0), 0);
+}
+
+function bitlockerRiskCounts(labels) {
+  const counts = {
+    total: (labels || []).length,
+    aggravating: 0,
+    unprotected: 0,
+    suspended: 0,
+    missing: 0,
+    protected: 0,
+  };
+  for (const label of labels || []) {
+    const risk = bitlockerRisk(label);
+    if (risk.status === "unprotected") counts.unprotected += 1;
+    else if (risk.status === "suspended") counts.suspended += 1;
+    else if (risk.status === "missing") counts.missing += 1;
+    else if (risk.status === "protected") counts.protected += 1;
+    if (risk.aggravating) counts.aggravating += 1;
+  }
+  return counts;
 }
 
 function polar(cx, cy, radius, index, total) {
@@ -411,8 +758,9 @@ function shortLabel(text, max = 22) {
 
 function dumpableLocals(except) {
   const skipRotating = excludeRotatingLocals();
-  return window.__hotel.unique_admins.filter((a) => {
-    if (a === except) return false;
+  const exceptKey = adminKey(except);
+  return scopedUniqueAdmins().filter((a) => {
+    if (exceptKey && adminKey(a) === exceptKey) return false;
     if (a.kind !== "local") return false;
     if (skipRotating && isRotatingLocal(a)) return false;
     return true;
@@ -452,9 +800,12 @@ function expandHops(fromHosts, alreadyReached, compromised, depth) {
     if (!origin.length) continue;
     const extra = (other.hosts || []).filter((h) => !alreadyReached.has(h));
     if (!extra.length) continue;
-    hops.push({ admin: other, extra, origin, depth });
+    hops.push({ admin: other, extra, origin, depth, blRisk: aggravatingCount(extra) });
   }
-  hops.sort((a, b) => b.extra.length - a.extra.length);
+  hops.sort((a, b) => {
+    if ((b.blRisk || 0) !== (a.blRisk || 0)) return (b.blRisk || 0) - (a.blRisk || 0);
+    return b.extra.length - a.extra.length;
+  });
   return hops;
 }
 
@@ -576,6 +927,7 @@ function showLateralTip(svg, e) {
   if (kind === "host" || kind === "hop-host") {
     const meta = hostMeta(node.dataset.host);
     const account = node.dataset.account;
+    const risk = bitlockerRisk(node.dataset.host);
     html = `
       <div class="mono strong">${escapeHtml(meta.name)}</div>
       ${meta.dns ? `<div class="muted">${escapeHtml(meta.dns)}</div>` : ""}
@@ -583,16 +935,19 @@ function showLateralTip(svg, e) {
       <div class="muted">${account
         ? `Also has local account ${escapeHtml(account)}`
         : `Has ${escapeHtml(adminDisplayName(window.__lateralAdmin))} as local admin`}</div>
+      <div>${risk.aggravating ? "Aggravating · " : ""}${escapeHtml(risk.label)}</div>
     `;
   } else if (kind === "hop-account" || kind === "hop-cluster" || kind === "hop3-account") {
-    const hopAdmin = (window.__hotel.unique_admins || []).find(
+    const hopAdmin = (scopedUniqueAdmins() || []).find(
       (a) => a.kind === "local" && a.account === node.dataset.account
     );
     const hosts = (hopAdmin && hopAdmin.hosts) || [];
     const depth = kind === "hop3-account" ? "3rd" : "2nd";
+    const risk = aggravatingCount(hosts);
     html = `
       <div class="mono strong">${escapeHtml(node.dataset.account)}</div>
       <div>${depth} hop · local account on ${fmt(hosts.length)} computer${hosts.length === 1 ? "" : "s"}</div>
+      ${risk ? `<div>Aggravating · ${fmt(risk)} lack BitLocker protection</div>` : ""}
       <div class="muted">Click to list every machine this name appears on.</div>
     `;
   } else if (kind === "compromised") {
@@ -687,6 +1042,7 @@ function renderFocusPanel(admin, hops, third, hiddenWks) {
       <div class="focus-head mono">${escapeHtml(meta.name)}</div>
       ${meta.dns ? `<div class="muted tiny">${escapeHtml(meta.dns)}</div>` : ""}
       <div class="muted">${meta.role === "server" ? "Server" : "Workstation"}${meta.ip ? ` · ${escapeHtml(meta.ip)}` : ""}</div>
+      <div class="muted">${escapeHtml(bitlockerRisk(focus.label).label)}</div>
       <div class="mini-label">Local accounts on it</div>
       ${locals.length
         ? `<ul class="account-on-host">${locals.map((a) => {
@@ -709,20 +1065,22 @@ function renderFocusPanel(admin, hops, third, hiddenWks) {
 }
 
 function hostPresenceTable(items) {
+  const showBl = Boolean(window.__hotel && window.__hotel.bitlocker && window.__hotel.bitlocker.available);
   const rows = (items || []).map((item) => {
-    if (typeof item === "string") return { meta: hostMeta(item), via: [] };
-    return { meta: hostMeta(item.label), via: item.via || [] };
+    if (typeof item === "string") return { meta: hostMeta(item), via: [], risk: bitlockerRisk(item) };
+    return { meta: hostMeta(item.label), via: item.via || [], risk: bitlockerRisk(item.label) };
   }).sort((a, b) => {
+    if (a.risk.aggravating !== b.risk.aggravating) return a.risk.aggravating ? -1 : 1;
     if (a.meta.role !== b.meta.role) return a.meta.role === "server" ? -1 : 1;
     return a.meta.name.localeCompare(b.meta.name, undefined, { sensitivity: "base" });
   });
   if (!rows.length) return `<div class="muted">No computers.</div>`;
   const showVia = rows.some((r) => r.via.length);
   return `<table class="presence-table">
-    <thead><tr><th>Computer</th><th>Role</th><th>IP</th>${showVia ? "<th>Via</th>" : ""}</tr></thead>
+    <thead><tr><th>Computer</th><th>Role</th><th>IP</th>${showBl ? "<th>BitLocker</th>" : ""}${showVia ? "<th>Via</th>" : ""}</tr></thead>
     <tbody>
       ${rows.map((row) => `
-        <tr class="hop-row presence-row" data-host="${escapeHtml(row.meta.label)}">
+        <tr class="hop-row presence-row${row.risk.aggravating ? " bl-risk-row" : ""}" data-host="${escapeHtml(row.meta.label)}">
           <td>
             <div class="mono">${escapeHtml(row.meta.name)}</div>
             ${row.meta.dns && row.meta.dns.toLowerCase() !== row.meta.name.toLowerCase()
@@ -730,6 +1088,7 @@ function hostPresenceTable(items) {
           </td>
           <td>${rolePill(row.meta.role)}</td>
           <td class="mono muted">${escapeHtml(row.meta.ip || "—")}</td>
+          ${showBl ? `<td>${bitlockerPill(row.risk.status)}</td>` : ""}
           ${showVia ? `<td class="muted">${row.via.length ? escapeHtml(row.via.map((a) => a.account).join(", ")) : "—"}</td>` : ""}
         </tr>
       `).join("")}
@@ -745,7 +1104,7 @@ function hopTableHtml(hops, focus, depth) {
         ${hops.slice(0, 12).map((h) => `
           <tr class="hop-row${focus && focus.type === "hop" && focus.account === h.admin.account ? " selected" : ""}" data-account="${escapeHtml(h.admin.account)}" data-depth="${depth}">
             <td class="mono">${escapeHtml(h.admin.account)}</td>
-            <td>${fmt(h.extra.length)}</td>
+            <td>${fmt(h.extra.length)}${h.blRisk ? `<div class="muted tiny">${fmt(h.blRisk)} no BitLocker</div>` : ""}</td>
           </tr>
         `).join("")}
       </tbody>
@@ -769,10 +1128,18 @@ function drawLateral(admin) {
   const extraCount = extraHostSet.size;
   const hop3Count = hop3HostSet.size;
   const totalReached = extraCount + hop3Count + directHosts.length;
-  const pct = data.host_count ? Math.round((totalReached / data.host_count) * 100) : 0;
+  const siteCount = scopedHosts().length || data.host_count;
+  const pct = siteCount ? Math.round((totalReached / siteCount) * 100) : 0;
   const focus = window.__lateralFocus;
+  const reachedLabels = [
+    ...(admin.hosts || []),
+    ...extraHostSet,
+    ...hop3HostSet,
+  ];
+  const blCounts = bitlockerRiskCounts(reachedLabels);
+  const showBl = Boolean(data.bitlocker && data.bitlocker.available);
 
-  $("lateral-summary").textContent = `${fmt(directHosts.length)} direct · +${fmt(extraCount)} hop 2 · +${fmt(hop3Count)} hop 3 (${pct}% of site)`;
+  $("lateral-summary").textContent = `${fmt(directHosts.length)} direct · +${fmt(extraCount)} hop 2 · +${fmt(hop3Count)} hop 3 (${pct}% of site)${tagFilterLabel()}${showBl && blCounts.aggravating ? ` · ${fmt(blCounts.aggravating)} no BitLocker` : ""}`;
   $("lateral-hop-note").textContent = excludeRotatingLocals()
     ? "Dump SAM/LSA on a reached host, then reuse other local names that appear elsewhere. Administrator, AdminDevice, and AdminIT are excluded — they use unique rotating passwords."
     : "Dump SAM/LSA on a reached host, then reuse other local names that appear elsewhere. Assumes the same local name reuses a password or hash.";
@@ -784,6 +1151,8 @@ function drawLateral(admin) {
     <div class="blast-line">${fmt(workstations.length)} workstations · ${fmt(servers.length)} servers</div>
     <div class="blast-line">${fmt(extraCount)} additional host${extraCount === 1 ? "" : "s"} at hop 2 (dump and reuse)</div>
     <div class="blast-line">${fmt(hop3Count)} additional host${hop3Count === 1 ? "" : "s"} at hop 3</div>
+    ${showBl ? `<div class="blast-line${blCounts.aggravating ? " aggravating" : ""}"><strong>${fmt(blCounts.aggravating)}</strong> of ${fmt(blCounts.total)} reached host${blCounts.total === 1 ? "" : "s"} lack BitLocker protection</div>
+    <div class="blast-line muted">${fmt(blCounts.unprotected)} not encrypted · ${fmt(blCounts.suspended)} protection off · ${fmt(blCounts.missing)} not in report</div>` : ""}
   `;
   $("lateral-hops").innerHTML = hops.length
     ? hopTableHtml(hops, focus, 2)
@@ -838,8 +1207,8 @@ function drawLateral(admin) {
       key: `account:${hop.admin.account}`,
       account: hop.admin.account,
       label: shortLabel(hop.admin.account, 18),
-      sub: `+${hop.extra.length} extra`,
-      title: `${hop.admin.account} · 2nd hop · ${hop.extra.length} extra computer(s)`,
+      sub: `+${hop.extra.length} extra${hop.blRisk ? ` · ${hop.blRisk} no BL` : ""}`,
+      title: `${hop.admin.account} · 2nd hop · ${hop.extra.length} extra computer(s)${hop.blRisk ? ` · ${hop.blRisk} lack BitLocker` : ""}`,
       ...outerLabel(x, y, cx, cy, 14),
     });
   });
@@ -854,8 +1223,8 @@ function drawLateral(admin) {
       key: `account:${hop.admin.account}`,
       account: hop.admin.account,
       label: shortLabel(hop.admin.account, 18),
-      sub: `+${hop.extra.length} extra`,
-      title: `${hop.admin.account} · 3rd hop · ${hop.extra.length} extra computer(s)`,
+      sub: `+${hop.extra.length} extra${hop.blRisk ? ` · ${hop.blRisk} no BL` : ""}`,
+      title: `${hop.admin.account} · 3rd hop · ${hop.extra.length} extra computer(s)${hop.blRisk ? ` · ${hop.blRisk} lack BitLocker` : ""}`,
       ...outerLabel(x, y, cx, cy, 14),
     });
   });
@@ -997,6 +1366,13 @@ function drawLateral(admin) {
     ly: cy + 50,
   });
 
+  nodes.forEach((n) => {
+    if (!n.host) return;
+    const risk = bitlockerRisk(n.host);
+    if (risk.aggravating) n.cls = `${n.cls || ""} bl-risk`.trim();
+    n.title = `${n.title || ""}\nBitLocker: ${risk.label}`;
+  });
+
   svg.innerHTML = `
     <defs>
       <filter id="node-glow" x="-50%" y="-50%" width="200%" height="200%">
@@ -1054,17 +1430,114 @@ function drawLateral(admin) {
 
 function selectLateralAdmin(admin) {
   const ranked = window.__lateralRanked || [];
-  const idx = ranked.indexOf(admin);
+  const idx = ranked.findIndex((a) => adminKey(a) === adminKey(admin));
   if (idx < 0 || !$("lateral-account")) return;
   $("lateral-account").value = String(idx);
   window.__lateralFocus = null;
   resetLateralView();
-  drawLateral(admin);
+  drawLateral(ranked[idx]);
 }
 
 function presencePill(presence) {
   const label = { workstation: "WKS only", server: "Server only", both: "Both" }[presence] || presence;
   return `<span class="pill ${presence}">${label}</span>`;
+}
+
+function tagKindCounts(hosts) {
+  const counts = { lanpms: 0, assets: 0 };
+  for (const host of hosts || []) {
+    const kinds = host.tag_kinds || [];
+    if (kinds.includes("lanpms")) counts.lanpms += 1;
+    if (kinds.includes("assets")) counts.assets += 1;
+  }
+  return counts;
+}
+
+function tagKindPills(kinds) {
+  if (!kinds || !kinds.length) return `<span class="muted">—</span>`;
+  return kinds.map((kind) => (
+    kind === "lanpms"
+      ? `<span class="pill lanpms">LANPMS</span>`
+      : `<span class="pill assets">Assets</span>`
+  )).join(" ");
+}
+
+function hostMatchesTagFilter(host) {
+  const wantLan = window.__filters.tagLanpms !== false;
+  const wantAssets = window.__filters.tagAssets !== false;
+  if (wantLan && wantAssets) return true;
+  if (!wantLan && !wantAssets) return false;
+  const kinds = host.tag_kinds || [];
+  if (wantLan) return kinds.includes("lanpms");
+  return kinds.includes("assets");
+}
+
+function hostLabel(host) {
+  return host.dns || host.netbios || host.ip;
+}
+
+function adminKey(admin) {
+  if (!admin) return "";
+  return `${admin.kind || ""}|${String(admin.domain || "").toLowerCase()}|${String(admin.account || "").toLowerCase()}`;
+}
+
+function tagFilterActive() {
+  const lan = window.__filters.tagLanpms !== false;
+  const assets = window.__filters.tagAssets !== false;
+  return !(lan && assets);
+}
+
+function tagFilterLabel() {
+  const lan = window.__filters.tagLanpms !== false;
+  const assets = window.__filters.tagAssets !== false;
+  if (lan && assets) return "";
+  if (lan) return " · LANPMS";
+  if (assets) return " · Assets";
+  return " · no tags";
+}
+
+function scopedHosts() {
+  return ((window.__hotel && window.__hotel.hosts) || []).filter(hostMatchesTagFilter);
+}
+
+function scopedUniqueAdmins() {
+  if (window.__scopedAdmins) return window.__scopedAdmins;
+  const data = window.__hotel;
+  if (!data) return [];
+  if (!tagFilterActive()) {
+    window.__scopedAdmins = data.unique_admins || [];
+    return window.__scopedAdmins;
+  }
+  const allowed = new Set(scopedHosts().map(hostLabel));
+  window.__scopedAdmins = (data.unique_admins || []).map((admin) => {
+    const hosts = (admin.hosts || []).filter((label) => allowed.has(label));
+    if (!hosts.length) return null;
+    const wks = (admin.workstation_hosts || []).filter((label) => allowed.has(label));
+    const srv = (admin.server_hosts || []).filter((label) => allowed.has(label));
+    const usages = (admin.usages || []).filter((u) => allowed.has(u.host));
+    let presence = "server";
+    if (wks.length && srv.length) presence = "both";
+    else if (wks.length) presence = "workstation";
+    return {
+      ...admin,
+      hosts,
+      host_count: hosts.length,
+      workstation_hosts: wks,
+      workstation_count: wks.length,
+      server_hosts: srv,
+      server_count: srv.length,
+      usages,
+      presence,
+    };
+  }).filter(Boolean);
+  return window.__scopedAdmins;
+}
+
+function applyTagScope() {
+  window.__scopedAdmins = null;
+  renderHostTable();
+  renderAdminTable();
+  refreshLateral();
 }
 
 function renderHostTable() {
@@ -1073,13 +1546,14 @@ function renderHostTable() {
   const q = ($("host-filter").value || "").toLowerCase();
   const rows = data.hosts.filter((h) => {
     if (role !== "all" && h.role !== role) return false;
+    if (!hostMatchesTagFilter(h)) return false;
     const blob = `${h.ip} ${h.dns} ${h.netbios} ${h.os}`.toLowerCase();
     return !q || blob.includes(q);
   });
   $("host-count").textContent = `${fmt(rows.length)} shown`;
   $("host-table").innerHTML = `
     <table>
-      <thead><tr><th>Host</th><th>Role</th><th>IP</th><th>OS</th><th>Admins</th></tr></thead>
+      <thead><tr><th>Host</th><th>Role</th><th>Tags</th><th>IP</th><th>OS</th><th>Admins</th></tr></thead>
       <tbody>
         ${rows.map((h) => `
           <tr class="host-row" data-idx="${data.hosts.indexOf(h)}">
@@ -1088,12 +1562,13 @@ function renderHostTable() {
               <div class="muted">${escapeHtml(h.netbios || "")}</div>
             </td>
             <td>${rolePill(h.role)}</td>
+            <td>${tagKindPills(h.tag_kinds)}</td>
             <td class="mono">${escapeHtml(h.ip || "—")}</td>
             <td>${escapeHtml(h.os || "—")}</td>
             <td>${h.admin_count}</td>
           </tr>
           <tr class="detail-row" data-for="${data.hosts.indexOf(h)}" hidden>
-            <td colspan="5" class="detail">${adminMiniTable(h.admins)}</td>
+            <td colspan="6" class="detail">${adminMiniTable(h.admins)}</td>
           </tr>
         `).join("")}
       </tbody>
@@ -1128,7 +1603,7 @@ function renderAdminTable() {
   const q = ($("admin-filter").value || "").toLowerCase();
   const kind = $("kind-filter").value;
   const presence = $("presence-filter").value;
-  const rows = data.unique_admins.filter((a) => {
+  const rows = scopedUniqueAdmins().filter((a) => {
     if (kind && a.kind !== kind) return false;
     if (presence && a.presence !== presence) return false;
     if (role === "workstation" && !a.workstation_count) return false;

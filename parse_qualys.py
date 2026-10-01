@@ -161,13 +161,29 @@ def extract_hotel_codes(dns: str, netbios: str, tags: list[str]) -> list[str]:
     tag_codes = _unique_codes(
         match for tag in tags for match in TAG_HOTEL_RE.findall(tag)
     )
-    if tag_codes:
-        tag_set = set(tag_codes)
-        preferred = [code for code in host_codes if code in tag_set]
-        return _unique_codes(preferred + tag_codes)
-    if len(host_codes) > 1:
+    if host_codes:
+        if tag_codes:
+            preferred = [code for code in host_codes if code in set(tag_codes)]
+            return preferred or host_codes[:1]
         return host_codes[:1]
-    return host_codes
+    return tag_codes
+
+
+def tag_kinds_by_hotel(tags: list[str]) -> dict[str, list[str]]:
+    by_hotel: dict[str, list[str]] = {}
+    for tag in tags:
+        upper = tag.upper()
+        if upper.endswith("LANPMS"):
+            kind = "lanpms"
+        elif upper.endswith("ASSETS"):
+            kind = "assets"
+        else:
+            continue
+        for code in _unique_codes(TAG_HOTEL_RE.findall(tag)):
+            bucket = by_hotel.setdefault(code, [])
+            if kind not in bucket:
+                bucket.append(kind)
+    return by_hotel
 
 
 def parse_admins(result: str) -> list[dict]:
@@ -209,16 +225,25 @@ def parse_host(raw: bytes) -> dict:
         "netbios": netbios,
         "os": os_name,
         "hotel_codes": codes,
+        "tag_kinds_by_hotel": tag_kinds_by_hotel(tags),
         "admins": admins,
         "admin_count": len(admins),
     }
 
 
+def is_bitlocker_xml(path: Path) -> bool:
+    name = path.name.lower()
+    return "bitlocker" in name or "bit_locker" in name
+
+
 def latest_xml(folder: Path | None = None) -> Path:
     folder = folder or ROOT
-    xmls = [p for p in folder.glob("*.xml") if p.is_file()]
+    xmls = [p for p in folder.glob("*.xml") if p.is_file() and not is_bitlocker_xml(p)]
     if not xmls:
-        raise FileNotFoundError(f"No Qualys XML export found in {folder}")
+        raise FileNotFoundError(
+            f"No Qualys administrator XML export found in {folder} "
+            "(files whose names contain 'bitlocker' are ignored)."
+        )
     return max(xmls, key=lambda p: p.stat().st_mtime)
 
 

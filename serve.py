@@ -10,10 +10,13 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from parse_bitlocker import latest_bitlocker_xml, load_bitlocker
+from parse_bitlocker import CACHE_PATH as BITLOCKER_CACHE_PATH
 from parse_qualys import cache_is_stale, latest_xml, load_cache
 
 ROOT = Path(__file__).resolve().parent
 DATA = None
+BITLOCKER = None
 HOTEL_INDEX = []
 LOCK = threading.RLock()
 
@@ -78,7 +81,93 @@ def _empty_role_stats() -> dict:
 
 def hotel_payload(code: str) -> dict | None:
     with LOCK:
-        return _hotel_payload(code)
+        payload = _hotel_payload(code)
+        bitlocker = _bitlocker_hotel(code)
+        if payload is None:
+            if not bitlocker.get("available") or not bitlocker.get("host_count"):
+                return None
+            payload = _empty_hotel_payload(code)
+        payload["bitlocker"] = bitlocker
+        return payload
+
+
+def _empty_role_stats_serialized() -> dict:
+    stats = _empty_role_stats()
+    stats["kind_counts"] = dict(stats["kind_counts"])
+    stats["os_counts"] = []
+    return stats
+
+
+def _empty_hotel_payload(code: str) -> dict:
+    return {
+        "code": code,
+        "host_count": 0,
+        "unique_admin_count": 0,
+        "admin_memberships": 0,
+        "kind_counts": {},
+        "os_counts": [],
+        "roles": {
+            "workstation": _empty_role_stats_serialized(),
+            "server": _empty_role_stats_serialized(),
+        },
+        "presence_counts": {"workstation": 0, "server": 0, "both": 0},
+        "hosts": [],
+        "unique_admins": [],
+    }
+
+
+def _bitlocker_hotel(code: str) -> dict:
+    if not BITLOCKER:
+        return {"available": False, "source": None, "host_count": 0, "hosts": []}
+    indexes = BITLOCKER["by_hotel"].get(code, [])
+    status_counts: Counter = Counter()
+    encryption_counts: Counter = Counter()
+    hosts = []
+    for idx in indexes:
+        host = BITLOCKER["hosts"][idx]
+        status_counts[host["os_status"]] += 1
+        if host.get("os_encryption"):
+            encryption_counts[host["os_encryption"]] += 1
+        hosts.append(
+            {
+                "ip": host["ip"],
+                "dns": host["dns"],
+                "netbios": host["netbios"],
+                "os": host["os"],
+                "role": host["role"],
+                "last_found": host.get("last_found") or "",
+                "os_status": host["os_status"],
+                "os_letter": host.get("os_letter") or "",
+                "os_encryption": host.get("os_encryption") or "",
+                "os_protection_label": host.get("os_protection_label") or "",
+                "os_conversion_label": host.get("os_conversion_label") or "",
+                "unprotected_fixed": host.get("unprotected_fixed") or 0,
+                "unprotected_removable": host.get("unprotected_removable") or 0,
+                "volumes": host.get("volumes") or [],
+            }
+        )
+    hosts.sort(
+        key=lambda h: (
+            {"unprotected": 0, "suspended": 1, "encrypting": 2, "decrypting": 3, "unknown": 4}.get(
+                h["os_status"], 5
+            ),
+            (h["dns"] or h["netbios"] or h["ip"]).lower(),
+        )
+    )
+    return {
+        "available": True,
+        "source": BITLOCKER.get("source"),
+        "host_count": len(hosts),
+        "os_protected": status_counts.get("protected", 0),
+        "os_unprotected": status_counts.get("unprotected", 0),
+        "os_suspended": status_counts.get("suspended", 0),
+        "os_encrypting": status_counts.get("encrypting", 0),
+        "os_decrypting": status_counts.get("decrypting", 0),
+        "os_unknown": status_counts.get("unknown", 0),
+        "unprotected_removable_hosts": sum(1 for host in hosts if host["unprotected_removable"]),
+        "encryption_counts": encryption_counts.most_common(6),
+        "hosts": hosts,
+    }
 
 
 def _hotel_payload(code: str) -> dict | None:
@@ -109,6 +198,7 @@ def _hotel_payload(code: str) -> dict | None:
                 "os": host["os"],
                 "role": role,
                 "hotel_codes": host["hotel_codes"],
+                "tag_kinds": (host.get("tag_kinds_by_hotel") or {}).get(code) or [],
                 "admin_count": host["admin_count"],
                 "admins": admins,
             }
@@ -242,6 +332,51 @@ def summary_payload() -> dict:
         "hotels": hotels,
         "latest_xml": xml_status()["latest_xml"],
         "stale": xml_status()["stale"],
+        "bitlocker": _bitlocker_summary(),
+    }
+
+
+def _bitlocker_summary() -> dict:
+    xml = latest_bitlocker_xml()
+    if not BITLOCKER:
+        return {
+            "available": False,
+            "source": None,
+            "latest_xml": xml.name if xml else None,
+            "stale": xml is not None,
+        }
+    status_counts: Counter = Counter(host["os_status"] for host in BITLOCKER["hosts"])
+    hotels = []
+    for code, indexes in BITLOCKER["by_hotel"].items():
+        hosts = [BITLOCKER["hosts"][idx] for idx in indexes]
+        hotels.append(
+            {
+                "code": code,
+                "hosts": len(hosts),
+                "os_unprotected": sum(1 for host in hosts if host["os_status"] == "unprotected"),
+                "os_suspended": sum(1 for host in hosts if host["os_status"] == "suspended"),
+                "os_protected": sum(1 for host in hosts if host["os_status"] == "protected"),
+            }
+        )
+    hotels.sort(
+        key=lambda h: (-(h["os_unprotected"] + h["os_suspended"]), -h["hosts"], h["code"])
+    )
+    admin_hotels = set(DATA["by_hotel"]) if DATA else set()
+    return {
+        "available": True,
+        "source": BITLOCKER.get("source"),
+        "generated": BITLOCKER.get("generated"),
+        "host_count": len(BITLOCKER["hosts"]),
+        "hotel_count": len(BITLOCKER["by_hotel"]),
+        "os_protected": status_counts.get("protected", 0),
+        "os_unprotected": status_counts.get("unprotected", 0),
+        "os_suspended": status_counts.get("suspended", 0),
+        "os_encrypting": status_counts.get("encrypting", 0) + status_counts.get("decrypting", 0),
+        "coverage_hotels": len(admin_hotels & set(BITLOCKER["by_hotel"])),
+        "admin_hotel_count": len(admin_hotels),
+        "hotels": hotels[:30],
+        "latest_xml": xml.name if xml else BITLOCKER.get("source"),
+        "stale": bitlocker_stale(),
     }
 
 
@@ -257,27 +392,46 @@ def xml_status() -> dict:
     }
 
 
-def apply_data(payload: dict) -> None:
-    global DATA, HOTEL_INDEX
+def bitlocker_stale() -> bool:
+    xml = latest_bitlocker_xml()
+    if xml is None:
+        return False
+    loaded = BITLOCKER.get("source") if BITLOCKER else None
+    return (
+        BITLOCKER is None
+        or loaded != xml.name
+        or cache_is_stale(xml, BITLOCKER_CACHE_PATH)
+    )
+
+
+def apply_data(payload: dict, bitlocker: dict | None = None) -> None:
+    global DATA, BITLOCKER, HOTEL_INDEX
     DATA = payload
-    HOTEL_INDEX = [
-        {"code": code, "hosts": len(indexes)}
-        for code, indexes in sorted(DATA["by_hotel"].items())
-    ]
+    BITLOCKER = bitlocker
+    hotels = {code: len(indexes) for code, indexes in DATA["by_hotel"].items()}
+    if BITLOCKER:
+        for code in BITLOCKER["by_hotel"]:
+            hotels.setdefault(code, 0)
+    HOTEL_INDEX = [{"code": code, "hosts": hotels[code]} for code in sorted(hotels)]
 
 
 def reload_data(force: bool = False) -> dict:
     status = xml_status()
-    if not force and not status["stale"]:
+    bl_stale = bitlocker_stale()
+    if not force and not status["stale"] and not bl_stale:
         return {
             "rebuilt": False,
             "source": status["loaded_source"],
             "latest_xml": status["latest_xml"],
-            "message": "Already using the latest XML export.",
+            "message": "Already using the latest XML exports.",
         }
     with LOCK:
-        payload = load_cache(force=True)
-        apply_data(payload)
+        payload = load_cache(force=force or status["stale"])
+        bitlocker = load_bitlocker(force=force or bl_stale)
+        apply_data(payload, bitlocker)
+    bits = [payload["source"]]
+    if bitlocker:
+        bits.append(bitlocker["source"])
     return {
         "rebuilt": True,
         "source": payload["source"],
@@ -285,7 +439,8 @@ def reload_data(force: bool = False) -> dict:
         "host_count": len(payload["hosts"]),
         "hotel_count": len(payload["by_hotel"]),
         "generated": payload["generated"],
-        "message": f"Loaded {payload['source']}.",
+        "bitlocker_source": bitlocker["source"] if bitlocker else None,
+        "message": "Loaded " + " and ".join(bits) + ".",
     }
 
 
@@ -391,9 +546,10 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main() -> None:
     print("Loading Qualys cache...", flush=True)
-    apply_data(load_cache())
+    apply_data(load_cache(), load_bitlocker())
+    bl_note = f" · BitLocker {BITLOCKER['source']}" if BITLOCKER else " · no BitLocker XML"
     print(
-        f"Ready: {len(DATA['hosts']):,} hosts, {len(DATA['by_hotel']):,} hotel codes · source {DATA['source']}",
+        f"Ready: {len(DATA['hosts']):,} hosts, {len(DATA['by_hotel']):,} hotel codes · source {DATA['source']}{bl_note}",
         flush=True,
     )
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)

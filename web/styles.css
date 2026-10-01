@@ -152,16 +152,54 @@ tr.selected { background: #22303b; }
 .pill.unknown { background: #2a323c; color: var(--muted); }
 .pill.workstation { background: #1b3a34; color: var(--accent); }
 .pill.server { background: #2e3344; color: #9db0d4; }
-.pill.both { background: #3a3420; color: var(--accent-2); }
+.pill.protected { background: #1b3a34; color: var(--accent); }
+.pill.lanpms { background: #1b3a34; color: var(--accent); }
+.pill.assets { background: #2e3344; color: #9db0d4; }
+.tag-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.pill.suspended { background: #3a3420; color: var(--accent-2); }
+.pill.encrypting, .pill.decrypting { background: #3a3420; color: var(--accent-2); }
+.bar-row .n.wide { width: 130px; }
+.fill.protected { background: var(--accent); }
+.fill.unprotected { background: var(--danger); }
+.fill.encrypting { background: var(--accent-2); }
+.bitlocker-card { margin-bottom: 16px; }
+.bitlocker-card .mix-label { width: 120px; }
+.bitlocker-note { margin: 0; padding: 0 16px 8px; font-size: 12px; line-height: 1.45; }
+.bitlocker-kpis { margin: 0 16px 8px; }
+.bitlocker-card .tabs { margin: 0; }
+.kpi.bl-kpi { cursor: pointer; }
+.kpi.bl-kpi:hover, .kpi.bl-kpi.active { border-color: var(--accent); }
 
 .kpi.role-kpi { cursor: pointer; }
 .kpi.role-kpi:hover, .kpi.role-kpi.active { border-color: var(--accent); }
 .stats-grid { margin-bottom: 16px; }
 .card .body.pad { padding: 12px 16px 16px; max-height: none; }
+.tabs-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 0 0 16px;
+}
+.tabs-row .tabs { margin: 0; }
 .tabs {
   display: flex;
   gap: 8px;
   margin: 0 0 16px;
+}
+.tag-filters {
+  display: flex;
+  align-items: center;
+  gap: 14px;
 }
 .tab {
   background: var(--panel);
@@ -264,6 +302,7 @@ tr.selected { background: #22303b; }
 .swatch.server { background: #7eb6ff; }
 .swatch.hop { background: #ff7a7a; }
 .swatch.hop3 { background: #c9a0ff; }
+.swatch.bl-risk { background: transparent; box-shadow: inset 0 0 0 2px #e07070; }
 .node-label {
   fill: #f3f7fb;
   font-size: 12px;
@@ -303,6 +342,8 @@ tr.selected { background: #22303b; }
 .lateral-side { padding: 14px 16px 16px; overflow: auto; max-height: 720px; }
 .lateral-blast { margin: 8px 0 16px; }
 .blast-line { margin: 0 0 6px; font-size: 13px; }
+.blast-line.aggravating { color: #f0a0a0; }
+.bl-risk-row { box-shadow: inset 3px 0 0 #e07070; }
 .hop-note { font-size: 12px; margin: 8px 0 10px; line-height: 1.45; }
 .hop-row { cursor: pointer; }
 .hop-row:hover { background: #1f2832; }
@@ -360,6 +401,7 @@ tr.selected { background: #22303b; }
 .node.hop-host { fill: #ff7a7a; }
 .node.hop3-account { fill: #c9a0ff; }
 .node.hop3-host { fill: #e0c8ff; }
+.node.bl-risk { stroke: #e07070; stroke-width: 3.2; }
 
 .toolbar {
   display: flex;
@@ -403,5 +445,9 @@ tr.selected { background: #22303b; }
 .bar-row .name { width: 72px; font-weight: 650; letter-spacing: 0.04em; }
 .track { flex: 1; height: 8px; background: #10161c; border-radius: 99px; overflow: hidden; }
 .track .fill { height: 100%; background: var(--accent); }
+.track .fill.protected { background: var(--accent); }
+.track .fill.unprotected { background: var(--danger); }
+.track .fill.suspended { background: var(--accent-2); }
+.track .fill.encrypting { background: var(--accent-2); }
 .bar-row .n { width: 70px; text-align: right; color: var(--muted); font-size: 12px; }
 .toolbar-inline { display: flex; gap: 12px; align-items: center; margin: 0 0 16px; }
